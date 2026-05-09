@@ -4,6 +4,8 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20|%20Linux-lightgrey.svg)]()
 
+[📖 中文文档](README_CN.md)
+
 **AI-native SSH toolkit.** Not a human terminal. Not an OpenSSH wrapper. A programmable backend that speaks JSON — built for agents, works for humans.
 
 AgentSSH talks SSH directly through `libssh2`. No shell wrappers. No screen scraping. No heuristics.
