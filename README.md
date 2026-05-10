@@ -13,6 +13,19 @@ AgentSSH talks SSH directly through `libssh2`. No shell wrappers. No screen scra
 
 ---
 
+## 🤖 AI Agent Skill
+
+Drop [`SKILL.md`](SKILL.md) into your agent's skills directory to give it SSH superpowers:
+
+```bash
+# OpenCode / Claude Code
+cp SKILL.md ~/.agents/skills/agentssh/SKILL.md
+```
+
+The agent gains: `exec`, `file upload/download`, session management, port forwarding, SOCKS5 proxy — all via structured JSON. See [SKILL.md](SKILL.md) for the full capability definition.
+
+---
+
 ## ✨ Why AgentSSH
 
 |  | Traditional SSH | AgentSSH |
