@@ -13,12 +13,7 @@ AgentSSH 通过 `libssh2` 直接跟 SSH 协议对话。没有 shell 包装，没
 
 ## 🤖 AI Agent Skill
 
-把 [`SKILL.md`](SKILL.md) 放入你的 agent skills 目录，赋予它 SSH 能力：
-
-```bash
-# OpenCode / Claude Code
-cp SKILL.md ~/.agents/skills/agentssh/SKILL.md
-```
+把 [`SKILL.md`](SKILL.md) 放入你的 agent skills 目录，赋予它 SSH 能力。不同 agent 的 skill 目录位置不同——请参照你所用 agent 的文档。
 
 agent 将获得：`exec`、文件上传下载、会话管理、端口转发、SOCKS5 代理——全部通过结构化 JSON。详见 [SKILL.md](SKILL.md)。
 
