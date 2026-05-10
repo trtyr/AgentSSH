@@ -66,15 +66,19 @@ Pass `--json` _before_ the subcommand: `agentssh --json exec --profile prod -- i
 
 The daemon buffers PTY output in `RemoteSession::output` with a cursor. Each `session send`/`session read` drains the channel, appends to the buffer, and returns a page (text from cursor, limited by `--limit`, default 8000 bytes). The cursor advances so repeated reads return new output. Buffer is capped at `MAX_BUFFER` (1 MB) — oldest data is trimmed when the limit is hit.
 
-`session read --follow` is implemented client-side: it repeatedly issues normal `Read` requests, prints one JSON line per page, and stops on shell exit, disconnect, SIGINT, or timeout.
-
-## Session output model
-
-The daemon buffers PTY output in `RemoteSession::output` with a cursor. Each `session send`/`session read` drains the channel, appends to the buffer, and returns a page (text from cursor, limited by `--limit`, default 8000 bytes). The cursor advances so repeated reads return new output. Buffer is capped at `MAX_BUFFER` (1 MB) — oldest data is trimmed when the limit is hit.
-
 `session send` also supports up to three expect/respond pairs. After sending the primary input, the daemon scans the accumulated output buffer for each `expect` pattern using case-insensitive regex matching when the pattern compiles, or case-insensitive substring fallback otherwise. On match, it sends the paired `respond` text and drains output again before returning.
 
 `session read --follow` is implemented client-side: it repeatedly issues normal `Read` requests, prints one JSON line per page, and stops on shell exit, disconnect, SIGINT, or timeout.
+
+### Output cleaning
+
+PTY output is scrubbed before being returned to callers (`util::strip_ansi`). The cleaning pipeline removes:
+
+- ANSI escape sequences (CSI, OSC, simple ESC codes)
+- Private Use Area characters (`U+E000`–`U+F8FF`) — eliminates Nerd Font icon garbage
+- Non-printable control characters except `\n`, `\r`, `\t`
+
+This keeps session output readable for AI agents even when the remote shell uses fancy prompts. Pass `--raw` on `session send` or `session read` to bypass cleaning and get the raw PTY bytes.
 
 ## Session health
 

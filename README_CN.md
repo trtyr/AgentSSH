@@ -1,5 +1,6 @@
 # 🦾 AgentSSH
 
+[![Crates.io](https://img.shields.io/crates/v/agentssh.svg)](https://crates.io/crates/agentssh)
 [![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20|%20Linux-lightgrey.svg)]()
@@ -31,7 +32,10 @@ AgentSSH 通过 `libssh2` 直接跟 SSH 协议对话。没有 shell 包装，没
 brew install libssh2        # macOS
 # apt install libssh2-dev   # Linux
 
-# 编译
+# 从 crates.io 安装（推荐）
+cargo install agentssh
+
+# 或从源码编译
 cargo build --release
 # → target/release/agentssh
 ```

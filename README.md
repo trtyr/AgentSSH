@@ -1,5 +1,6 @@
 # 🦾 AgentSSH
 
+[![Crates.io](https://img.shields.io/crates/v/agentssh.svg)](https://crates.io/crates/agentssh)
 [![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20|%20Linux-lightgrey.svg)]()
@@ -33,7 +34,10 @@ AgentSSH talks SSH directly through `libssh2`. No shell wrappers. No screen scra
 brew install libssh2        # macOS
 # apt install libssh2-dev   # Linux
 
-# Build
+# Install from crates.io (recommended)
+cargo install agentssh
+
+# Or build from source
 cargo build --release
 # → target/release/agentssh
 ```
