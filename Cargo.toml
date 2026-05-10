@@ -6,7 +6,7 @@ description = "AI-native SSH toolkit — programmable JSON-speaking SSH/SFTP bac
 license = "MIT"
 repository = "https://github.com/trtyr/AgentSSH"
 readme = "README.md"
-keywords = ["ssh", "sftp", "ai", "agent", "cli", "automation"]
+keywords = ["ssh", "sftp", "ai", "agent", "cli"]
 categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
