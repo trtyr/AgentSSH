@@ -52,6 +52,7 @@ Key modules:
 - `session exec --session-id <id> -- <command>` runs a single command on the session's SSH connection via `channel.exec()` — no PTY, returns clean stdout/stderr/exit_code. Contrast with `session send` which sends raw text through the PTY channel (suitable for interactive use).
 - `session close` decrements the connection refcount and drops the pooled SSH session when the last channel closes.
 - A background heartbeat thread wakes every 60 seconds and drains PTY output for each session.
+- When `--reconnect` is passed to `connect`, the heartbeat also watches for SSH transport disconnections and automatically re-establishes the connection with a fresh PTY channel. Reconnect uses the stored `ConnectArgs` for authentication and appends a `[AgentSSH] session <id> reconnected` notice to the output buffer.
 
 ## Profiles
 

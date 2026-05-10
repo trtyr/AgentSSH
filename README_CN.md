@@ -63,9 +63,14 @@ agentssh --json exec --profile prod --retry 3 -- uptime
 ### 🔄 长连接会话
 
 ```bash
-agentssh connect --profile prod
-# → session_id: s1（后台守护进程自动启动）
+agentssh connect --profile prod --reconnect
+# → session_id: s1（断连自动重连）
 
+# 干净命令执行（无 PTY 回显 — 结构化 JSON）
+agentssh session exec --session-id s1 -- uname -a
+# → {"exit_status":0, "stdout":"Linux ...\n", "stderr":""}
+
+# 交互式 PTY 模式
 agentssh session send --session-id s1 --input "ls -la\n"
 agentssh session send --session-id s1 \
   --input "sudo systemctl restart nginx\n" \

@@ -65,9 +65,14 @@ agentssh --json exec --profile prod --retry 3 -- uptime
 ### 🔄 Long-lived sessions
 
 ```bash
-agentssh connect --profile prod
-# → session_id: s1 (background daemon auto-starts)
+agentssh connect --profile prod --reconnect
+# → session_id: s1 (auto-reconnect on disconnect)
 
+# Clean command execution (no PTY echo — structured JSON)
+agentssh session exec --session-id s1 -- uname -a
+# → {"exit_status":0, "stdout":"Linux ...\n", "stderr":""}
+
+# Interactive PTY mode
 agentssh session send --session-id s1 --input "ls -la\n"
 agentssh session send --session-id s1 \
   --input "sudo systemctl restart nginx\n" \
