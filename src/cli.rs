@@ -211,6 +211,9 @@ pub struct ConnectCommand {
     pub wait_ms: u64,
     #[arg(long, default_value_t = DEFAULT_LIMIT)]
     pub limit: usize,
+    /// Enable automatic reconnection when the SSH transport drops
+    #[arg(long)]
+    pub reconnect: bool,
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]

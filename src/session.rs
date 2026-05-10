@@ -1,8 +1,8 @@
-use crate::cli::{ConnectCommand, ReadCommand, ResizeCommand, SessionExecCommand, SessionInputCommand, SignalCommand, SpawnCommand};
+use crate::cli::{ConnectArgs, ConnectCommand, ReadCommand, ResizeCommand, SessionExecCommand, SessionInputCommand, SignalCommand, SpawnCommand};
 use crate::connection::{SessionIdentity, SharedConnection, connect_with_info, get_connection_mut, next_connection_id};
 use crate::interactive::output_matches;
 use crate::kernel::ServerState;
-use crate::util::{MAX_BUFFER, now_ms, sleep_ms, strip_ansi};
+use crate::util::{MAX_BUFFER, log_daemon, now_ms, sleep_ms, strip_ansi};
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 use shell_words;
@@ -25,6 +25,8 @@ pub struct RemoteSession {
     pub(crate) rows: u32,
     pub(crate) exit_status: Option<i32>,
     pub(crate) exit_signal: Option<String>,
+    pub(crate) connect_args: ConnectArgs,
+    pub(crate) reconnect: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +43,8 @@ pub fn create_session(
     rows: u32,
     wait_ms: u64,
     limit: usize,
+    connect_args: ConnectArgs,
+    reconnect: bool,
 ) -> Result<Value> {
     let shell = {
         let connection = get_connection_mut(state, connection_id)?;
@@ -72,6 +76,8 @@ pub fn create_session(
         rows,
         exit_status: None,
         exit_signal: None,
+        connect_args,
+        reconnect,
     };
 
     sleep_ms(wait_ms);
@@ -217,7 +223,55 @@ pub fn normalize_input(input: &str, crlf: bool) -> String {
     }
 }
 
+pub fn attempt_reconnect(session: &mut RemoteSession) -> Option<(ssh2::Session, Channel)> {
+    if !session.reconnect {
+        return None;
+    }
+    let old_id = session.id.clone();
+    let _ = log_daemon(&format!("attempting reconnect for session {}", old_id));
+
+    let (new_ssh, _host, _port, _username) = match connect_with_info(session.connect_args.clone()) {
+        Ok(conn) => conn,
+        Err(e) => {
+            let _ = log_daemon(&format!("reconnect failed for session {}: {e:#}", old_id));
+            return None;
+        }
+    };
+
+    new_ssh.set_blocking(true);
+    let new_shell = match new_ssh.channel_session() {
+        Ok(mut shell) => {
+            if shell.request_pty("xterm-256color", None, Some((session.cols, session.rows, 0, 0))).is_err()
+                || shell.shell().is_err()
+            {
+                let _ = log_daemon(&format!("reconnect PTY failed for session {}", old_id));
+                return None;
+            }
+            shell
+        }
+        Err(e) => {
+            let _ = log_daemon(&format!("reconnect PTY failed for session {}: {e:#}", old_id));
+            return None;
+        }
+    };
+
+    let mut old_shell = std::mem::replace(&mut session.shell, new_shell);
+    let _ = old_shell.close();
+    let _ = old_shell.wait_close();
+    new_ssh.set_blocking(false);
+
+    session.status = "running".to_string();
+    session.updated_at = now_ms();
+    let notice = format!("\r\n[AgentSSH] session {} reconnected\r\n", old_id);
+    session.output.extend_from_slice(notice.as_bytes());
+    session.cursor = session.output.len();
+
+    let _ = log_daemon(&format!("session {} reconnected", old_id));
+    Some((new_ssh, old_shell))
+}
+
 pub fn daemon_connect(command: ConnectCommand, state: &mut ServerState) -> Result<Value> {
+    let connect_args = command.connect.clone();
     let (ssh, host, port, username) = connect_with_info(command.connect)?;
     let connection_id = next_connection_id(state);
     let identity = SessionIdentity { host, port, username };
@@ -233,6 +287,8 @@ pub fn daemon_connect(command: ConnectCommand, state: &mut ServerState) -> Resul
         command.rows,
         command.wait_ms,
         command.limit,
+        connect_args,
+        command.reconnect,
     )
 }
 
@@ -248,6 +304,8 @@ pub fn daemon_spawn(command: SpawnCommand, state: &mut ServerState) -> Result<Va
         username: source.username.clone(),
     };
     let connection_id = source.connection_id.clone();
+    let connect_args = source.connect_args.clone();
+    let reconnect = source.reconnect;
     create_session(
         state,
         &connection_id,
@@ -256,6 +314,8 @@ pub fn daemon_spawn(command: SpawnCommand, state: &mut ServerState) -> Result<Va
         command.rows,
         command.wait_ms,
         command.limit,
+        connect_args,
+        reconnect,
     )
 }
 

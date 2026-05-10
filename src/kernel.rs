@@ -1,10 +1,11 @@
 use crate::cli::ReadCommand;
 use crate::protocol::{WireRequest, WireResponse};
 use crate::ssh_backend::{
-    ProxyState, RemoteSession, SharedConnection, daemon_connect, daemon_download, daemon_exec,
-    daemon_ls, daemon_ping, daemon_proxy_close, daemon_proxy_create, daemon_proxy_list,
-    daemon_proxy_ping, daemon_read, daemon_resize, daemon_send, daemon_signal, daemon_spawn,
-    daemon_status, daemon_upload, refresh_session_state, session_summary,
+    ProxyState, RemoteSession, SharedConnection, attempt_reconnect, daemon_connect,
+    daemon_download, daemon_exec, daemon_ls, daemon_ping, daemon_proxy_close,
+    daemon_proxy_create, daemon_proxy_list, daemon_proxy_ping, daemon_read, daemon_resize,
+    daemon_send, daemon_signal, daemon_spawn, daemon_status, daemon_upload,
+    refresh_session_state, session_summary,
 };
 use crate::util::{log_daemon, now_ms, runtime_socket_path, sleep_ms};
 use anyhow::{Context, Result, bail};
@@ -254,6 +255,7 @@ fn spawn_heartbeat(state: Arc<Mutex<ServerState>>) {
         };
         let mut alive = 0_usize;
         let checked = guard.sessions.len();
+        let mut reconnect_candidates = Vec::new();
         for session in guard.sessions.values_mut() {
             let previous_status = session.status.clone();
             refresh_session_state(session);
@@ -262,8 +264,32 @@ fn spawn_heartbeat(state: Arc<Mutex<ServerState>>) {
             }
             if previous_status != "disconnected" && session.status == "disconnected" {
                 let _ = log_daemon(&format!("session {} disconnected", session.id));
+                if session.reconnect {
+                    reconnect_candidates.push(session.id.clone());
+                }
             }
         }
+        let mut next_id = guard.next_connection_id;
+        for sid in reconnect_candidates {
+            let mut session = match guard.sessions.remove(&sid) {
+                Some(s) => s,
+                None => continue,
+            };
+            if let Some((new_ssh, _old_shell)) = attempt_reconnect(&mut session) {
+                next_id += 1;
+                let new_conn_id = format!("c{}", next_id);
+                session.connection_id = new_conn_id.clone();
+                guard.connections.insert(
+                    new_conn_id,
+                    SharedConnection {
+                        ssh: new_ssh,
+                        refcount: 1,
+                    },
+                );
+            }
+            guard.sessions.insert(sid, session);
+        }
+        guard.next_connection_id = next_id;
         let _ = log_daemon(&format!("heartbeat: {} sessions checked, {} alive", checked, alive));
     });
 }
