@@ -1,7 +1,7 @@
 use crate::cli::{
     ConnectCommand, ListCommand, ProxyCloseCommand, ProxyCreateCommand, ProxyPingCommand,
-    ReadCommand, ResizeCommand, SessionInputCommand, SignalCommand, SpawnCommand, StatusCommand,
-    TransferCommand,
+    ReadCommand, ResizeCommand, SessionExecCommand, SessionInputCommand, SignalCommand,
+    SpawnCommand, StatusCommand, TransferCommand,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,6 +19,7 @@ pub enum WireRequest {
     Connect(ConnectCommand),
     Send(SessionInputCommand),
     Spawn(SpawnCommand),
+    Exec(SessionExecCommand),
     Read(ReadCommand),
     Resize(ResizeCommand),
     Signal(SignalCommand),

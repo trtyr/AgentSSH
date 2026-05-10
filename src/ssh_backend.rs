@@ -18,7 +18,7 @@ pub use crate::proxy::{
 };
 #[allow(unused_imports)]
 pub use crate::session::{
-    RemoteSession, SessionMetadataForTesting, create_session, daemon_connect,
+    RemoteSession, SessionMetadataForTesting, create_session, daemon_connect, daemon_exec,
     daemon_output_response, daemon_ping, daemon_read, daemon_resize, daemon_send,
     daemon_signal, daemon_spawn, daemon_status, ensure_session_connected, get_session_mut,
     normalize_input, page_output, refresh_session_state, session_metadata, session_summary,

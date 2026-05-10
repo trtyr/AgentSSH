@@ -24,7 +24,7 @@ Microkernel design. The CLI binary is both client and daemon — the same binary
 | --------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------- |
 | `exec`, `shell` | `ssh_backend::run_exec/shell()`                                      | One-shot; no daemon needed                                                |
 | `connect`       | `kernel::run_client(WireRequest::Connect)`                           | Starts a long-lived PTY session and a shared SSH connection entry         |
-| `session *`     | `kernel::run_client()` / `kernel::run_read_command()`                | Daemon-backed session lifecycle, spawn, health, and streaming reads       |
+| `session *`     | `kernel::run_client()` / `kernel::run_read_command()`                | Daemon-backed session lifecycle, spawn, exec, health, and streaming reads |
 | `file *`        | daemon or one-shot SSH depending on `--session-id`                   | Shared transfer structs, dual-path routing                                |
 | `proxy *`       | `kernel::run_client()` → daemon-managed threads                      | Local port forwarding (`-L`) and SOCKS5 (`-D`) via `channel_direct_tcpip` |
 | `profile *`     | `profile::run_profile()`                                             | Direct file I/O, no daemon                                                |
@@ -49,6 +49,7 @@ Key modules:
 - Wire protocol: one JSON `WireRequest` per line → one JSON `WireResponse` per line. Stateless per-request; session state lives in `ServerState::sessions`.
 - `ServerState::connections` tracks shared SSH `Session` objects by `connection_id`; each entry holds the authenticated SSH session plus a channel refcount.
 - `connect` creates both a session record and a new pooled connection. `session spawn --from <id>` opens a fresh PTY channel on the same pooled SSH connection, increments the refcount, and creates another session record.
+- `session exec --session-id <id> -- <command>` runs a single command on the session's SSH connection via `channel.exec()` — no PTY, returns clean stdout/stderr/exit_code. Contrast with `session send` which sends raw text through the PTY channel (suitable for interactive use).
 - `session close` decrements the connection refcount and drops the pooled SSH session when the last channel closes.
 - A background heartbeat thread wakes every 60 seconds and drains PTY output for each session.
 
@@ -131,6 +132,7 @@ cargo run -- exec --profile test -- uname -a
 # Daemon session
 cargo run -- connect --profile test
 cargo run -- session send --session-id s1 --input "ls\n"
+cargo run -- session exec --session-id s1 -- uname -a
 cargo run -- session read --session-id s1
 cargo run -- session ping --session-id s1
 cargo run -- session close --session-id s1

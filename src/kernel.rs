@@ -1,10 +1,10 @@
 use crate::cli::ReadCommand;
 use crate::protocol::{WireRequest, WireResponse};
 use crate::ssh_backend::{
-    ProxyState, RemoteSession, SharedConnection, daemon_connect, daemon_download, daemon_ls,
-    daemon_ping, daemon_proxy_close, daemon_proxy_create, daemon_proxy_list, daemon_proxy_ping,
-    daemon_read, daemon_resize, daemon_send, daemon_signal, daemon_spawn, daemon_status,
-    daemon_upload, refresh_session_state, session_summary,
+    ProxyState, RemoteSession, SharedConnection, daemon_connect, daemon_download, daemon_exec,
+    daemon_ls, daemon_ping, daemon_proxy_close, daemon_proxy_create, daemon_proxy_list,
+    daemon_proxy_ping, daemon_read, daemon_resize, daemon_send, daemon_signal, daemon_spawn,
+    daemon_status, daemon_upload, refresh_session_state, session_summary,
 };
 use crate::util::{log_daemon, now_ms, runtime_socket_path, sleep_ms};
 use anyhow::{Context, Result, bail};
@@ -137,6 +137,7 @@ fn handle_request(request: WireRequest, state: &mut ServerState) -> Result<Value
             Ok(response)
         },
         WireRequest::Send(command) => daemon_send(command, state),
+        WireRequest::Exec(command) => daemon_exec(command, state),
         WireRequest::Spawn(command) => daemon_spawn(command, state),
         WireRequest::Read(command) => daemon_read(command, state),
         WireRequest::Resize(command) => daemon_resize(command, state),

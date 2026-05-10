@@ -1,10 +1,11 @@
-use crate::cli::{ConnectCommand, ReadCommand, ResizeCommand, SessionInputCommand, SignalCommand, SpawnCommand};
+use crate::cli::{ConnectCommand, ReadCommand, ResizeCommand, SessionExecCommand, SessionInputCommand, SignalCommand, SpawnCommand};
 use crate::connection::{SessionIdentity, SharedConnection, connect_with_info, get_connection_mut, next_connection_id};
 use crate::interactive::output_matches;
 use crate::kernel::ServerState;
 use crate::util::{MAX_BUFFER, now_ms, sleep_ms, strip_ansi};
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
+use shell_words;
 use ssh2::Channel;
 use std::io::{Read, Write};
 
@@ -256,6 +257,34 @@ pub fn daemon_spawn(command: SpawnCommand, state: &mut ServerState) -> Result<Va
         command.wait_ms,
         command.limit,
     )
+}
+
+pub fn daemon_exec(command: SessionExecCommand, state: &mut ServerState) -> Result<Value> {
+    let connection_id = {
+        let session = get_session_mut(state, &command.session_id)?;
+        ensure_session_connected(session)?;
+        session.connection_id.clone()
+    };
+    let connection = get_connection_mut(state, &connection_id)?;
+
+    connection.ssh.set_blocking(true);
+    let command_line = shell_words::join(command.command);
+    let mut channel = connection.ssh.channel_session()?;
+    channel.exec(&command_line)?;
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    channel.read_to_string(&mut stdout)?;
+    channel.stderr().read_to_string(&mut stderr)?;
+    channel.wait_close()?;
+    let exit_status = channel.exit_status()?;
+    connection.ssh.set_blocking(false);
+
+    Ok(serde_json::json!({
+        "session_id": command.session_id,
+        "exit_status": exit_status,
+        "stdout": stdout,
+        "stderr": stderr,
+    }))
 }
 
 pub fn daemon_send(command: SessionInputCommand, state: &mut ServerState) -> Result<Value> {

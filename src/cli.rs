@@ -65,6 +65,8 @@ pub enum SessionCommand {
     Spawn(SpawnCommand),
     /// Read output from a session's cursor position
     Read(ReadCommand),
+    /// Run a command on the session's SSH connection (clean stdout/stderr/exit code — no PTY echo)
+    Exec(SessionExecCommand),
     /// Change PTY dimensions of a session
     Resize(ResizeCommand),
     /// Send a signal to a session (INT, TERM, KILL, etc.)
@@ -320,6 +322,14 @@ pub struct StatusCommand {
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct SessionExecCommand {
+    #[arg(long)]
+    pub session_id: String,
+    #[arg(required = true, trailing_var_arg = true)]
+    pub command: Vec<String>,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct TransferCommand {
     #[command(flatten)]
     pub connect: ConnectArgs,
@@ -382,6 +392,7 @@ pub fn run() -> Result<()> {
         Command::Connect(command) => kernel::run_client(WireRequest::Connect(command), cli.json),
         Command::Session(group) => match group.command {
             SessionCommand::Send(command) => kernel::run_client(WireRequest::Send(command), cli.json),
+            SessionCommand::Exec(command) => kernel::run_client(WireRequest::Exec(command), cli.json),
             SessionCommand::Spawn(command) => {
                 kernel::run_client(WireRequest::Spawn(command), cli.json)
             }
