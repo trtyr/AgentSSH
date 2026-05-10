@@ -20,17 +20,18 @@ cargo build --release          # release binary at target/release/agentssh
 
 Microkernel design. The CLI binary is both client and daemon — the same binary dispatched by subcommand:
 
-| Command group | Path | Notes |
-|---|---|---|
-| `exec`, `shell` | `ssh_backend::run_exec/shell()` | One-shot; no daemon needed |
-| `connect` | `kernel::run_client(WireRequest::Connect)` | Starts a long-lived PTY session and a shared SSH connection entry |
-| `session *` | `kernel::run_client()` / `kernel::run_read_command()` | Daemon-backed session lifecycle, spawn, health, and streaming reads |
-| `file *` | daemon or one-shot SSH depending on `--session-id` | Shared transfer structs, dual-path routing |
-| `proxy *` | `kernel::run_client()` → daemon-managed threads | Local port forwarding (`-L`) and SOCKS5 (`-D`) via `channel_direct_tcpip` |
-| `profile *` | `profile::run_profile()` | Direct file I/O, no daemon |
-| `daemon *` | `kernel::run_server()` / `kernel::run_client(WireRequest::Shutdown)` | Daemon lifecycle commands |
+| Command group   | Path                                                                 | Notes                                                                     |
+| --------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `exec`, `shell` | `ssh_backend::run_exec/shell()`                                      | One-shot; no daemon needed                                                |
+| `connect`       | `kernel::run_client(WireRequest::Connect)`                           | Starts a long-lived PTY session and a shared SSH connection entry         |
+| `session *`     | `kernel::run_client()` / `kernel::run_read_command()`                | Daemon-backed session lifecycle, spawn, health, and streaming reads       |
+| `file *`        | daemon or one-shot SSH depending on `--session-id`                   | Shared transfer structs, dual-path routing                                |
+| `proxy *`       | `kernel::run_client()` → daemon-managed threads                      | Local port forwarding (`-L`) and SOCKS5 (`-D`) via `channel_direct_tcpip` |
+| `profile *`     | `profile::run_profile()`                                             | Direct file I/O, no daemon                                                |
+| `daemon *`      | `kernel::run_server()` / `kernel::run_client(WireRequest::Shutdown)` | Daemon lifecycle commands                                                 |
 
 Key modules:
+
 - `main.rs` — only boots `cli::run()`
 - `cli.rs` — clap parser + grouped command dispatch
 - `kernel.rs` — daemon lifecycle, Unix-socket IPC, `ServerState`, heartbeat thread, follow-read client loop
@@ -59,7 +60,7 @@ Key modules:
 
 ## JSON output
 
-Pass `--json` *before* the subcommand: `agentssh --json exec --profile prod -- id`. Most commands wrap output in `{"ok":true,"data":...}`. `agentssh --json session read --follow ...` instead emits one compact JSON object per line so clients can stream updates incrementally.
+Pass `--json` _before_ the subcommand: `agentssh --json exec --profile prod -- id`. Most commands wrap output in `{"ok":true,"data":...}`. `agentssh --json session read --follow ...` instead emits one compact JSON object per line so clients can stream updates incrementally.
 
 ## Session output model
 
@@ -84,6 +85,7 @@ The daemon buffers PTY output in `RemoteSession::output` with a cursor. Each `se
 ## SFTP dual path (important)
 
 `file upload`, `file download`, and `file ls` each have two code paths:
+
 1. **With `--session-id`** → routed through daemon (`kernel::run_client`), reuses the existing SSH session.
 2. **Without `--session-id`** → one-shot SSH connection (`ssh_backend::run_*_once`), connects + does the operation + disconnects.
 
@@ -92,6 +94,7 @@ The `TransferCommand` and `ListCommand` structs carry both `ConnectArgs` and opt
 ### Transfer method fallback
 
 `--method auto` (default) tries protocols in order:
+
 1. **SFTP** — full-featured; works on most Linux servers.
 2. **SCP** — simpler protocol via `scp_send`/`scp_recv`; works when SFTP subsystem is disabled.
 3. **exec** — base64 + PowerShell (`[IO.File]::WriteAllBytes` / `[IO.File]::ReadAllBytes`); handles Windows OpenSSH servers where neither SFTP nor SCP is available.
@@ -112,6 +115,7 @@ On macOS, `TcpListener::set_nonblocking(true)` causes accepted `TcpStream` socke
 ## Testing
 
 Small unit tests live in `cli.rs`, `kernel.rs`, and `ssh_backend.rs`. For manual smoke testing:
+
 ```bash
 # Profile CRUD
 cargo run -- profile write test --data '{"host":"localhost","username":"root"}'

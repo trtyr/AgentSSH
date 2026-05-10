@@ -79,51 +79,53 @@ pub fn stat_json(stat: FileStat) -> Value {
     })
 }
 
-/// Strip ANSI escape sequences from a string.
-/// Removes CSI (\x1b[...m/K/etc), OSC (\x1b]...\x07/\x1b\\), and simple ESC sequences.
+/// Strip ANSI escape sequences, Private Use Area characters (Nerd Font icons),
+/// and non-printable control characters from PTY output.
+///
+/// Keeps: printable characters, newlines (`\n`), carriage returns (`\r`), tabs (`\t`).
+/// Removes: ANSI escape sequences (CSI/OSC/simple ESC), Private Use Area
+///          codepoints (`U+E000`–`U+F8FF`), and other control characters.
 pub fn strip_ansi(text: &str) -> String {
-    let bytes = text.as_bytes();
     let mut result = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b && i + 1 < bytes.len() {
-            match bytes[i + 1] {
-                b'[' => {
-                    // CSI: ESC [ ... (0x40-0x7E)
-                    i += 2;
-                    while i < bytes.len() && !(0x40..=0x7E).contains(&bytes[i]) {
-                        i += 1;
-                    }
-                    if i < bytes.len() {
-                        i += 1; // skip the final byte
-                    }
-                }
-                b']' => {
-                    // OSC: ESC ] ... (BEL or ESC\)
-                    i += 2;
-                    while i < bytes.len() {
-                        if bytes[i] == 0x07 || (bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\') {
-                            if bytes[i] == 0x1b {
-                                i += 2;
-                            } else {
-                                i += 1;
-                            }
+    let mut chars = text.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            let next = chars.next();
+            match next {
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('\x40'..='\x7E').contains(&c) {
                             break;
                         }
-                        i += 1;
                     }
                 }
-                _ => {
-                    // Other ESC sequences: skip ESC + next char
-                    i += 2;
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' && chars.next() == Some('\\') {
+                            break;
+                        }
+                    }
                 }
+                Some(_) | None => {}
             }
-        } else {
-            result.push(bytes[i] as char);
-            i += 1;
+        } else if is_keepable(ch) {
+            result.push(ch);
         }
     }
     result
+}
+
+fn is_keepable(ch: char) -> bool {
+    match ch {
+        '\n' | '\r' | '\t' => true,
+        _ if ch.is_control() => false,
+        _ if ('\u{E000}'..='\u{F8FF}').contains(&ch) => false,
+        _ => true,
+    }
 }
 
 pub fn config_dir() -> Result<PathBuf> {
@@ -189,5 +191,45 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         unsafe { std::env::remove_var("AGENTSSH_LOG"); }
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_color_codes() {
+        let input = "hello \x1b[31mred\x1b[0m world";
+        assert_eq!(strip_ansi(input), "hello red world");
+    }
+
+    #[test]
+    fn strip_ansi_removes_osc_sequences() {
+        let input = "title\x1b]0;window title\x07body";
+        assert_eq!(strip_ansi(input), "titlebody");
+    }
+
+    #[test]
+    fn strip_ansi_removes_private_use_area_characters() {
+        let folder = '\u{F31B}';
+        let home = '\u{F015}';
+        let input = format!("{folder} {home} ~");
+        assert_eq!(strip_ansi(&input), "  ~");
+    }
+
+    #[test]
+    fn strip_ansi_removes_control_characters_except_whitespace() {
+        assert_eq!(strip_ansi("a\x07b\x08c"), "abc");
+        assert_eq!(strip_ansi("line1\nline2\r\nline3"), "line1\nline2\r\nline3");
+        assert_eq!(strip_ansi("col1\tcol2"), "col1\tcol2");
+    }
+
+    #[test]
+    fn strip_ansi_handles_empty_and_clean_input() {
+        assert_eq!(strip_ansi(""), "");
+        assert_eq!(strip_ansi("clean text"), "clean text");
+    }
+
+    #[test]
+    fn strip_ansi_handles_nested_ansi_and_pua() {
+        let folder = '\u{F31B}';
+        let input = format!("\x1b[32m{folder}\x1b[0m README.md");
+        assert_eq!(strip_ansi(&input), " README.md");
     }
 }
