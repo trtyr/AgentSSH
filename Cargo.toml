@@ -2,6 +2,12 @@
 name = "agentssh"
 version = "0.1.0"
 edition = "2024"
+description = "AI-native SSH toolkit — programmable JSON-speaking SSH/SFTP backend for AI agents"
+license = "MIT"
+repository = "https://github.com/trtyr/AgentSSH"
+readme = "README.md"
+keywords = ["ssh", "sftp", "ai", "agent", "cli", "automation"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 anyhow = "1.0.100"
