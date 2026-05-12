@@ -68,6 +68,21 @@ agentssh --json exec --profile prod --retry 3 -- uptime
 # {"ok":true,"data":{"exit_status":0,"stdout":"21:03:01 up 42 days\n","stderr":""}}
 ```
 
+命令通过 `/bin/sh -c` 执行——管道、重定向、链式命令原生支持：
+
+```bash
+# 管道过滤
+agentssh --json exec --profile prod -- grep ERROR /var/log/syslog \| tail -5
+
+# 远程重定向写入文件
+agentssh --json exec --profile prod -- cat \> /etc/config \</dev/null
+
+# 链式命令
+agentssh --json exec --profile prod -- ls /etc \&\& systemctl status nginx
+```
+
+> **提示**：用反斜杠转义 `|`、`>`、`&&` 防止本地 shell 吞掉它们。
+
 ### 🔄 长连接会话
 
 ```bash

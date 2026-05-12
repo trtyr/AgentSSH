@@ -22,7 +22,7 @@ Microkernel design. The CLI binary is both client and daemon — the same binary
 
 | Command group   | Path                                                                 | Notes                                                                     |
 | --------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| `exec`, `shell` | `ssh_backend::run_exec/shell()`                                      | One-shot; no daemon needed                                                |
+| `exec`, `shell` | `ssh_backend::run_exec/shell()`                                      | One-shot; no daemon needed. `exec` joins args with spaces and runs via `/bin/sh -c` so pipes/redirects/&& work. |
 | `connect`       | `kernel::run_client(WireRequest::Connect)`                           | Starts a long-lived PTY session and a shared SSH connection entry         |
 | `session *`     | `kernel::run_client()` / `kernel::run_read_command()`                | Daemon-backed session lifecycle, spawn, exec, health, and streaming reads |
 | `file *`        | daemon or one-shot SSH depending on `--session-id`                   | Shared transfer structs, dual-path routing                                |
@@ -49,7 +49,7 @@ Key modules:
 - Wire protocol: one JSON `WireRequest` per line → one JSON `WireResponse` per line. Stateless per-request; session state lives in `ServerState::sessions`.
 - `ServerState::connections` tracks shared SSH `Session` objects by `connection_id`; each entry holds the authenticated SSH session plus a channel refcount.
 - `connect` creates both a session record and a new pooled connection. `session spawn --from <id>` opens a fresh PTY channel on the same pooled SSH connection, increments the refcount, and creates another session record.
-- `session exec --session-id <id> -- <command>` runs a single command on the session's SSH connection via `channel.exec()` — no PTY, returns clean stdout/stderr/exit_code. Contrast with `session send` which sends raw text through the PTY channel (suitable for interactive use).
+- `session exec --session-id <id> -- <command>` runs a single command on the session's SSH connection via `channel.exec()` — no PTY, returns clean stdout/stderr/exit_code. Command args are joined with spaces and wrapped in `/bin/sh -c`, so shell metacharacters (`|`, `>`, `&&`, `;`) are interpreted by the remote shell. Contrast with `session send` which sends raw text through the PTY channel (suitable for interactive use).
 - `session close` decrements the connection refcount and drops the pooled SSH session when the last channel closes.
 - A background heartbeat thread wakes every 60 seconds and drains PTY output for each session.
 - When `--reconnect` is passed to `connect`, the heartbeat also watches for SSH transport disconnections and automatically re-establishes the connection with a fresh PTY channel. Reconnect uses the stored `ConnectArgs` for authentication and appends a `[AgentSSH] session <id> reconnected` notice to the output buffer.
@@ -63,6 +63,15 @@ Key modules:
 ## JSON output
 
 Pass `--json` _before_ the subcommand: `agentssh --json exec --profile prod -- id`. Most commands wrap output in `{"ok":true,"data":...}`. `agentssh --json session read --follow ...` instead emits one compact JSON object per line so clients can stream updates incrementally.
+
+## Exec command shell model
+
+Both one-shot `exec` and `session exec` join all trailing args with spaces and run them through `/bin/sh -c` on the remote host. This means:
+
+- Shell metacharacters (`|`, `>`, `&&`, `;`) are interpreted by the remote shell
+- Escaping metacharacters on the CLI prevents the local shell from eating them: `\|`, `\>`, `\&\&`
+- Or quote the entire command: `agentssh exec -- "grep ERROR /var/log/syslog | tail -5"`
+- This matches `ssh`, `kubectl exec`, and `docker exec` behavior
 
 ## Session output model
 

@@ -70,6 +70,21 @@ agentssh --json exec --profile prod --retry 3 -- uptime
 # {"ok":true,"data":{"exit_status":0,"stdout":"21:03:01 up 42 days\n","stderr":""}}
 ```
 
+Commands run through `/bin/sh -c` — pipes, redirects, and shell chains work natively:
+
+```bash
+# Pipe and filter
+agentssh --json exec --profile prod -- grep ERROR /var/log/syslog \| tail -5
+
+# Redirect output to remote file
+agentssh --json exec --profile prod -- cat \> /etc/config \</dev/null
+
+# Chain commands
+agentssh --json exec --profile prod -- ls /etc \&\& systemctl status nginx
+```
+
+> **Tip**: Escape `|`, `>`, `&&` with backslashes so your local shell doesn't eat them.
+
 ### 🔄 Long-lived sessions
 
 ```bash
