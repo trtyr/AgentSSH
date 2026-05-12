@@ -22,7 +22,7 @@ Microkernel design. The CLI binary is both client and daemon — the same binary
 
 | Command group   | Path                                                                 | Notes                                                                     |
 | --------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| `exec`, `shell` | `ssh_backend::run_exec/shell()`                                      | One-shot; no daemon needed. `exec` joins args with spaces and runs via `/bin/sh -c` so pipes/redirects/&& work. |
+| `exec`, `shell` | `ssh_backend::run_exec/shell()`                                      | One-shot; no daemon needed. `exec` joins args with spaces; the SSH server's own exec handling interprets shell metacharacters. |
 | `connect`       | `kernel::run_client(WireRequest::Connect)`                           | Starts a long-lived PTY session and a shared SSH connection entry         |
 | `session *`     | `kernel::run_client()` / `kernel::run_read_command()`                | Daemon-backed session lifecycle, spawn, exec, health, and streaming reads |
 | `file *`        | daemon or one-shot SSH depending on `--session-id`                   | Shared transfer structs, dual-path routing                                |
@@ -66,7 +66,7 @@ Pass `--json` _before_ the subcommand: `agentssh --json exec --profile prod -- i
 
 ## Exec command shell model
 
-Both one-shot `exec` and `session exec` join all trailing args with spaces and run them through `/bin/sh -c` on the remote host. This means:
+Both one-shot `exec` and `session exec` join all trailing args with spaces and pass them to the SSH server. The SSH server (OpenSSH) runs the command through the user's login shell (`$SHELL -c`), so:
 
 - Shell metacharacters (`|`, `>`, `&&`, `;`) are interpreted by the remote shell
 - Escaping metacharacters on the CLI prevents the local shell from eating them: `\|`, `\>`, `\&\&`

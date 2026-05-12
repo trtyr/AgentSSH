@@ -33,7 +33,7 @@ pub fn run_exec(command: ExecCommand, json: bool) -> Result<()> {
     let (session, _, _, _) = connect_with_info(command.connect)?;
     let command_line = command.command.join(" ");
     let mut channel = session.channel_session()?;
-    channel.exec(&format!("/bin/sh -c {}", command_line))?;
+    channel.exec(&command_line)?;
     let mut stdout = String::new();
     let mut stderr = String::new();
     channel.read_to_string(&mut stdout)?;

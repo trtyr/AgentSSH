@@ -329,7 +329,7 @@ pub fn daemon_exec(command: SessionExecCommand, state: &mut ServerState) -> Resu
     connection.ssh.set_blocking(true);
     let command_line = command.command.join(" ");
     let mut channel = connection.ssh.channel_session()?;
-    channel.exec(&format!("/bin/sh -c {}", command_line))?;
+    channel.exec(&command_line)?;
     let mut stdout = String::new();
     let mut stderr = String::new();
     channel.read_to_string(&mut stdout)?;
