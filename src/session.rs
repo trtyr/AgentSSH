@@ -5,7 +5,6 @@ use crate::kernel::ServerState;
 use crate::util::{MAX_BUFFER, log_daemon, now_ms, sleep_ms, strip_ansi};
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
-use shell_words;
 use ssh2::Channel;
 use std::io::{Read, Write};
 
@@ -328,9 +327,9 @@ pub fn daemon_exec(command: SessionExecCommand, state: &mut ServerState) -> Resu
     let connection = get_connection_mut(state, &connection_id)?;
 
     connection.ssh.set_blocking(true);
-    let command_line = shell_words::join(command.command);
+    let command_line = command.command.join(" ");
     let mut channel = connection.ssh.channel_session()?;
-    channel.exec(&command_line)?;
+    channel.exec(&format!("/bin/sh -c {}", command_line))?;
     let mut stdout = String::new();
     let mut stderr = String::new();
     channel.read_to_string(&mut stdout)?;
