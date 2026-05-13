@@ -2,9 +2,10 @@ use crate::cli::ReadCommand;
 use crate::protocol::{WireRequest, WireResponse};
 use crate::ssh_backend::{
     ProxyState, RemoteSession, SharedConnection, attempt_reconnect, daemon_connect,
-    daemon_download, daemon_exec, daemon_ls, daemon_ping, daemon_proxy_close,
-    daemon_proxy_create, daemon_proxy_list, daemon_proxy_ping, daemon_read, daemon_resize,
-    daemon_send, daemon_signal, daemon_spawn, daemon_status, daemon_upload, daemon_write,
+    daemon_file_delete, daemon_file_edit, daemon_file_read, daemon_download, daemon_exec,
+    daemon_ls, daemon_ping, daemon_proxy_close, daemon_proxy_create, daemon_proxy_list,
+    daemon_proxy_ping, daemon_read, daemon_resize, daemon_send, daemon_signal, daemon_spawn,
+    daemon_status, daemon_upload, daemon_write,
     refresh_session_state, session_summary,
 };
 use crate::util::{log_daemon, now_ms, runtime_socket_path, sleep_ms};
@@ -183,6 +184,9 @@ fn handle_request(request: WireRequest, state: &mut ServerState) -> Result<Value
         WireRequest::Download(command) => daemon_download(command, state),
         WireRequest::Ls(command) => daemon_ls(command, state),
         WireRequest::Write(command) => daemon_write(command, state),
+        WireRequest::ReadFile(command) => daemon_file_read(command, state),
+        WireRequest::DeleteFile(command) => daemon_file_delete(command, state),
+        WireRequest::EditFile(command) => daemon_file_edit(command, state),
         WireRequest::ProxyCreate(command) => {
             let response = daemon_proxy_create(command, state)?;
             if let (Some(proxy_id), Some(local_addr)) = (

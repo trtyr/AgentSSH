@@ -1,10 +1,11 @@
-use crate::cli::{ListCommand, TransferCommand, WriteCommand};
+use crate::cli::{DeleteFileCommand, EditFileCommand, ListCommand, ReadFileCommand, TransferCommand, WriteCommand};
 use crate::connection::connect_with_info;
 use crate::kernel::ServerState;
 use crate::util::{emit_message, stat_json};
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use regex;
 use serde_json::Value;
 use std::fs;
 use std::io::{Read, Write};
@@ -162,6 +163,119 @@ pub fn run_write_once(command: WriteCommand, json: bool) -> Result<()> {
     )
 }
 
+pub fn daemon_file_read(command: ReadFileCommand, state: &mut ServerState) -> Result<Value> {
+    let session_id = command
+        .session_id
+        .clone()
+        .ok_or_else(|| anyhow!("--session-id is required for this operation. Get one with 'agentssh connect'."))?;
+    let connection_id = state
+        .sessions
+        .get(&session_id)
+        .ok_or_else(|| anyhow!("session '{}' not found. Use 'agentssh session list' to see active sessions.", session_id))?
+        .connection_id
+        .clone();
+    let connection = state
+        .connections
+        .get_mut(&connection_id)
+        .ok_or_else(|| anyhow!("connection '{}' not found", connection_id))?;
+    connection.ssh.set_blocking(true);
+    let result = sftp_read(&connection.ssh, &command.remote, Some(&session_id));
+    connection.ssh.set_blocking(false);
+    result
+}
+
+pub fn run_read_once(command: ReadFileCommand, json: bool) -> Result<()> {
+    let (session, _, _, _) = connect_with_info(command.connect.clone())?;
+    let result = sftp_read(&session, &command.remote, None)?;
+    if json {
+        crate::util::print_json(&result)?;
+        return Ok(());
+    }
+    if let Some(content) = result.get("content").and_then(|v| v.as_str()) {
+        print!("{content}");
+    }
+    Ok(())
+}
+
+pub fn daemon_file_delete(command: DeleteFileCommand, state: &mut ServerState) -> Result<Value> {
+    let session_id = command
+        .session_id
+        .clone()
+        .ok_or_else(|| anyhow!("--session-id is required for this operation. Get one with 'agentssh connect'."))?;
+    let connection_id = state
+        .sessions
+        .get(&session_id)
+        .ok_or_else(|| anyhow!("session '{}' not found. Use 'agentssh session list' to see active sessions.", session_id))?
+        .connection_id
+        .clone();
+    let connection = state
+        .connections
+        .get_mut(&connection_id)
+        .ok_or_else(|| anyhow!("connection '{}' not found", connection_id))?;
+    connection.ssh.set_blocking(true);
+    let result = delete_with_fallback(&connection.ssh, &command, Some(&session_id));
+    connection.ssh.set_blocking(false);
+    result
+}
+
+pub fn run_delete_once(command: DeleteFileCommand, json: bool) -> Result<()> {
+    let (session, _, _, _) = connect_with_info(command.connect.clone())?;
+    delete_with_fallback(&session, &command, None)?;
+    emit_message(json, "deleted", &command.remote.display().to_string())
+}
+
+pub fn daemon_file_edit(command: EditFileCommand, state: &mut ServerState) -> Result<Value> {
+    let session_id = command
+        .session_id
+        .clone()
+        .ok_or_else(|| anyhow!("--session-id is required for this operation. Get one with 'agentssh connect'."))?;
+    let connection_id = state
+        .sessions
+        .get(&session_id)
+        .ok_or_else(|| anyhow!("session '{}' not found. Use 'agentssh session list' to see active sessions.", session_id))?
+        .connection_id
+        .clone();
+    let connection = state
+        .connections
+        .get_mut(&connection_id)
+        .ok_or_else(|| anyhow!("connection '{}' not found", connection_id))?;
+    connection.ssh.set_blocking(true);
+    let result = sftp_edit(
+        &connection.ssh,
+        &command.remote,
+        &command.find,
+        &command.replace,
+        command.regex,
+        Some(&session_id),
+    );
+    connection.ssh.set_blocking(false);
+    result
+}
+
+pub fn run_edit_once(command: EditFileCommand, json: bool) -> Result<()> {
+    let (session, _, _, _) = connect_with_info(command.connect.clone())?;
+    let result = sftp_edit(
+        &session,
+        &command.remote,
+        &command.find,
+        &command.replace,
+        command.regex,
+        None,
+    )?;
+    emit_message(
+        json,
+        "edited",
+        &format!(
+            "{} ({})",
+            command.remote.display(),
+            result
+                .get("replacements")
+                .and_then(|v| v.as_u64())
+                .map_or("?".to_string(), |n| n.to_string())
+        ),
+    )
+}
+
 fn upload_with_method(session: &ssh2::Session, command: &TransferCommand, session_id: Option<&str>) -> Result<Value> {
     match command.method.as_str() {
         "sftp" => sftp_upload(session, &command.local, &command.remote, session_id),
@@ -227,6 +341,169 @@ fn write_with_method(session: &ssh2::Session, command: &WriteCommand, session_id
         exec_write(session, &command.remote, &command.content, session_id)
             .with_context(|| format!("write fallback exhausted after SFTP error: {sftp_error}"))
     })
+}
+
+fn sftp_read(session: &ssh2::Session, remote: &Path, session_id: Option<&str>) -> Result<Value> {
+    let sftp = session
+        .sftp()
+        .context("SFTP is not available on this server. The SSH server may not have the sftp subsystem enabled.")?;
+    let mut file = sftp
+        .open(remote)
+        .with_context(|| format!("open remote file {}", remote.display()))?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    let stat = sftp.stat(remote).ok();
+    let mut result = serde_json::json!({
+        "remote": remote,
+        "content": content,
+        "bytes": content.len(),
+        "method": "sftp"
+    });
+    if let Some(stat) = stat {
+        result["stat"] = stat_json(stat);
+    }
+    if let Some(session_id) = session_id {
+        result["session_id"] = serde_json::json!(session_id);
+    }
+    Ok(result)
+}
+
+fn delete_with_fallback(session: &ssh2::Session, command: &DeleteFileCommand, session_id: Option<&str>) -> Result<Value> {
+    sftp_delete(session, &command.remote, command.recursive, session_id).or_else(|sftp_error| {
+        if !is_sftp_error(&sftp_error) {
+            return Err(sftp_error);
+        }
+        exec_delete(session, &command.remote, command.recursive, session_id)
+            .with_context(|| format!("delete fallback exhausted after SFTP error: {sftp_error}"))
+    })
+}
+
+fn sftp_delete(
+    session: &ssh2::Session,
+    remote: &Path,
+    recursive: bool,
+    session_id: Option<&str>,
+) -> Result<Value> {
+    let sftp = session
+        .sftp()
+        .context("SFTP is not available on this server. The SSH server may not have the sftp subsystem enabled.")?;
+    let stat = sftp
+        .stat(remote)
+        .with_context(|| format!("stat remote path {}", remote.display()))?;
+    let deleted_type = if stat.is_dir() {
+        if recursive {
+            sftp_rmdir_recursive(&sftp, remote).with_context(|| format!("recursive remove {}", remote.display()))?;
+        } else {
+            sftp.rmdir(remote)
+                .with_context(|| format!("rmdir {} (use --recursive for non-empty directories)", remote.display()))?;
+        }
+        "directory"
+    } else {
+        sftp.unlink(remote)
+            .with_context(|| format!("unlink {}", remote.display()))?;
+        "file"
+    };
+    let mut result = serde_json::json!({
+        "remote": remote,
+        "deleted": true,
+        "type": deleted_type,
+        "method": "sftp"
+    });
+    if let Some(session_id) = session_id {
+        result["session_id"] = serde_json::json!(session_id);
+    }
+    Ok(result)
+}
+
+fn sftp_rmdir_recursive(sftp: &ssh2::Sftp, path: &Path) -> Result<()> {
+    for (entry_path, stat) in sftp.readdir(path)? {
+        let full = path.join(&entry_path);
+        if stat.is_dir() {
+            sftp_rmdir_recursive(sftp, &full)?;
+        } else {
+            sftp.unlink(&full)?;
+        }
+    }
+    sftp.rmdir(path)?;
+    Ok(())
+}
+
+fn exec_delete(
+    session: &ssh2::Session,
+    remote: &Path,
+    recursive: bool,
+    session_id: Option<&str>,
+) -> Result<Value> {
+    session.set_blocking(true);
+    let remote_lossy = remote.to_string_lossy();
+    let remote_str = shell_words::quote(&remote_lossy);
+    let command = if recursive {
+        format!("rm -rf {}", remote_str)
+    } else {
+        format!("rm {}", remote_str)
+    };
+    let output = exec_remote_command(session, &command)
+        .with_context(|| format!("exec delete {}", remote.display()))?;
+    if !output.trim().is_empty() {
+        return Err(anyhow!("delete failed: {}", output.trim()));
+    }
+    let mut result = serde_json::json!({
+        "remote": remote,
+        "deleted": true,
+        "type": if recursive { "directory" } else { "path" },
+        "method": "exec"
+    });
+    if let Some(session_id) = session_id {
+        result["session_id"] = serde_json::json!(session_id);
+    }
+    Ok(result)
+}
+
+fn sftp_edit(
+    session: &ssh2::Session,
+    remote: &Path,
+    find: &str,
+    replace: &str,
+    use_regex: bool,
+    session_id: Option<&str>,
+) -> Result<Value> {
+    let sftp = session
+        .sftp()
+        .context("SFTP is not available on this server. The SSH server may not have the sftp subsystem enabled.")?;
+    let mut file = sftp
+        .open(remote)
+        .with_context(|| format!("open remote file {}", remote.display()))?;
+    let mut original = String::new();
+    file.read_to_string(&mut original)?;
+
+    let (modified, replacements) = if use_regex {
+        let re = regex::Regex::new(find)
+            .with_context(|| format!("invalid regex pattern '{find}'"))?;
+        let count = re.find_iter(&original).count();
+        let result = re.replace_all(&original, replace).into_owned();
+        (result, count)
+    } else {
+        let count = original.matches(find).count();
+        (original.replace(find, replace), count)
+    };
+
+    if replacements == 0 {
+        return Err(anyhow!("pattern not found in {}", remote.display()));
+    }
+
+    sftp.create(remote)
+        .with_context(|| format!("create remote file {}", remote.display()))?
+        .write_all(modified.as_bytes())?;
+
+    let mut result = serde_json::json!({
+        "remote": remote,
+        "replacements": replacements,
+        "method": "sftp"
+    });
+    if let Some(session_id) = session_id {
+        result["session_id"] = serde_json::json!(session_id);
+    }
+    Ok(result)
 }
 
 fn sftp_upload(session: &ssh2::Session, local: &Path, remote: &Path, session_id: Option<&str>) -> Result<Value> {

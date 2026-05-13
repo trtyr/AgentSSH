@@ -97,6 +97,12 @@ pub enum FileCommand {
     Ls(ListCommand),
     /// Write text content directly to a remote file
     Write(WriteCommand),
+    /// Read a remote file to stdout
+    Read(ReadFileCommand),
+    /// Delete a remote file or directory
+    Delete(DeleteFileCommand),
+    /// Find-and-replace text in a remote file
+    Edit(EditFileCommand),
 }
 
 #[derive(Args, Debug)]
@@ -373,6 +379,44 @@ pub struct WriteCommand {
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct ReadFileCommand {
+    #[command(flatten)]
+    pub connect: ConnectArgs,
+    #[arg(long)]
+    pub session_id: Option<String>,
+    #[arg(long)]
+    pub remote: PathBuf,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct DeleteFileCommand {
+    #[command(flatten)]
+    pub connect: ConnectArgs,
+    #[arg(long)]
+    pub session_id: Option<String>,
+    #[arg(long)]
+    pub remote: PathBuf,
+    #[arg(long)]
+    pub recursive: bool,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct EditFileCommand {
+    #[command(flatten)]
+    pub connect: ConnectArgs,
+    #[arg(long)]
+    pub session_id: Option<String>,
+    #[arg(long)]
+    pub remote: PathBuf,
+    #[arg(long)]
+    pub find: String,
+    #[arg(long)]
+    pub replace: String,
+    #[arg(long)]
+    pub regex: bool,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct ProxyCreateCommand {
     #[command(flatten)]
     pub connect: ConnectArgs,
@@ -454,6 +498,27 @@ pub fn run() -> Result<()> {
                     kernel::run_client(WireRequest::Write(command), cli.json)
                 } else {
                     ssh_backend::run_write_once(command, cli.json)
+                }
+            }
+            FileCommand::Read(command) => {
+                if command.session_id.is_some() {
+                    kernel::run_client(WireRequest::ReadFile(command), cli.json)
+                } else {
+                    ssh_backend::run_read_once(command, cli.json)
+                }
+            }
+            FileCommand::Delete(command) => {
+                if command.session_id.is_some() {
+                    kernel::run_client(WireRequest::DeleteFile(command), cli.json)
+                } else {
+                    ssh_backend::run_delete_once(command, cli.json)
+                }
+            }
+            FileCommand::Edit(command) => {
+                if command.session_id.is_some() {
+                    kernel::run_client(WireRequest::EditFile(command), cli.json)
+                } else {
+                    ssh_backend::run_edit_once(command, cli.json)
                 }
             }
         },
