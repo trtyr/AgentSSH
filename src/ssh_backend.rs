@@ -26,7 +26,8 @@ pub use crate::session::{
 };
 #[allow(unused_imports)]
 pub use crate::sftp::{
-    daemon_download, daemon_ls, daemon_upload, run_download_once, run_ls_once, run_upload_once,
+    daemon_download, daemon_ls, daemon_upload, daemon_write, run_download_once, run_ls_once,
+    run_upload_once, run_write_once,
 };
 
 pub fn run_exec(command: ExecCommand, json: bool) -> Result<()> {

@@ -1,4 +1,4 @@
-use crate::cli::{ListCommand, TransferCommand};
+use crate::cli::{ListCommand, TransferCommand, WriteCommand};
 use crate::connection::connect_with_info;
 use crate::kernel::ServerState;
 use crate::util::{emit_message, stat_json};
@@ -130,6 +130,38 @@ pub fn run_ls_once(command: ListCommand, json: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn daemon_write(command: WriteCommand, state: &mut ServerState) -> Result<Value> {
+    let session_id = command
+        .session_id
+        .clone()
+        .ok_or_else(|| anyhow!("--session-id is required for this operation. Get one with 'agentssh connect'."))?;
+    let connection_id = state
+        .sessions
+        .get(&session_id)
+        .ok_or_else(|| anyhow!("session '{}' not found. Use 'agentssh session list' to see active sessions.", session_id))?
+        .connection_id
+        .clone();
+
+    let connection = state
+        .connections
+        .get_mut(&connection_id)
+        .ok_or_else(|| anyhow!("connection '{}' not found", connection_id))?;
+    connection.ssh.set_blocking(true);
+    let result = write_with_method(&connection.ssh, &command, Some(&session_id));
+    connection.ssh.set_blocking(false);
+    result
+}
+
+pub fn run_write_once(command: WriteCommand, json: bool) -> Result<()> {
+    let (session, _, _, _) = connect_with_info(command.connect.clone())?;
+    write_with_method(&session, &command, None)?;
+    emit_message(
+        json,
+        "written",
+        &format!("{} bytes -> {} (sftp)", command.content.len(), command.remote.display()),
+    )
+}
+
 fn upload_with_method(session: &ssh2::Session, command: &TransferCommand, session_id: Option<&str>) -> Result<Value> {
     match command.method.as_str() {
         "sftp" => sftp_upload(session, &command.local, &command.remote, session_id),
@@ -187,6 +219,16 @@ fn ls_with_method(session: &ssh2::Session, command: &ListCommand, session_id: Op
     }
 }
 
+fn write_with_method(session: &ssh2::Session, command: &WriteCommand, session_id: Option<&str>) -> Result<Value> {
+    sftp_write(session, &command.remote, &command.content, session_id).or_else(|sftp_error| {
+        if !is_sftp_error(&sftp_error) {
+            return Err(sftp_error);
+        }
+        exec_write(session, &command.remote, &command.content, session_id)
+            .with_context(|| format!("write fallback exhausted after SFTP error: {sftp_error}"))
+    })
+}
+
 fn sftp_upload(session: &ssh2::Session, local: &Path, remote: &Path, session_id: Option<&str>) -> Result<Value> {
     let sftp = session
         .sftp()
@@ -217,6 +259,32 @@ fn exec_upload(session: &ssh2::Session, local: &Path, remote: &Path, session_id:
     let command = build_exec_upload_command(remote, &encoded)?;
     exec_powershell(session, &command).with_context(|| format!("exec upload remote file {}", remote.display()))?;
     Ok(transfer_result_json(local, remote, "exec", session_id))
+}
+
+fn sftp_write(session: &ssh2::Session, remote: &Path, content: &str, session_id: Option<&str>) -> Result<Value> {
+    let sftp = session
+        .sftp()
+        .context("SFTP is not available on this server. The SSH server may not have the sftp subsystem enabled.")?;
+    sftp.create(remote)
+        .with_context(|| format!("create remote file {}", remote.display()))?
+        .write_all(content.as_bytes())?;
+    Ok(write_result_json(remote, content.len(), "sftp", session_id))
+}
+
+fn exec_write(session: &ssh2::Session, remote: &Path, content: &str, session_id: Option<&str>) -> Result<Value> {
+    session.set_blocking(true);
+    let encoded = B64.encode(content.as_bytes());
+    if encoded.len() >= EXEC_UPLOAD_BASE64_LIMIT {
+        return Err(anyhow!(
+            "exec write payload too large: base64 length {} exceeds limit {}",
+            encoded.len(),
+            EXEC_UPLOAD_BASE64_LIMIT
+        ));
+    }
+    let command = build_exec_upload_command(remote, &encoded)?;
+    exec_powershell(session, &command)
+        .with_context(|| format!("exec write remote file {}", remote.display()))?;
+    Ok(write_result_json(remote, content.len(), "exec", session_id))
 }
 
 fn sftp_download(session: &ssh2::Session, remote: &Path, local: &Path, session_id: Option<&str>) -> Result<Value> {
@@ -354,6 +422,18 @@ fn transfer_result_json(local: &Path, remote: &Path, method: &str, session_id: O
     let mut result = serde_json::json!({
         "local": local,
         "remote": remote,
+        "method": method
+    });
+    if let Some(session_id) = session_id {
+        result["session_id"] = serde_json::json!(session_id);
+    }
+    result
+}
+
+fn write_result_json(remote: &Path, bytes: usize, method: &str, session_id: Option<&str>) -> Value {
+    let mut result = serde_json::json!({
+        "remote": remote,
+        "bytes": bytes,
         "method": method
     });
     if let Some(session_id) = session_id {

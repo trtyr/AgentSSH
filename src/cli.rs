@@ -95,6 +95,8 @@ pub enum FileCommand {
     Download(TransferCommand),
     /// List files in a remote directory
     Ls(ListCommand),
+    /// Write text content directly to a remote file
+    Write(WriteCommand),
 }
 
 #[derive(Args, Debug)]
@@ -359,6 +361,18 @@ pub struct ListCommand {
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct WriteCommand {
+    #[command(flatten)]
+    pub connect: ConnectArgs,
+    #[arg(long)]
+    pub session_id: Option<String>,
+    #[arg(long)]
+    pub remote: PathBuf,
+    #[arg(long)]
+    pub content: String,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct ProxyCreateCommand {
     #[command(flatten)]
     pub connect: ConnectArgs,
@@ -433,6 +447,13 @@ pub fn run() -> Result<()> {
                     kernel::run_client(WireRequest::Ls(command), cli.json)
                 } else {
                     ssh_backend::run_ls_once(command, cli.json)
+                }
+            }
+            FileCommand::Write(command) => {
+                if command.session_id.is_some() {
+                    kernel::run_client(WireRequest::Write(command), cli.json)
+                } else {
+                    ssh_backend::run_write_once(command, cli.json)
                 }
             }
         },
