@@ -157,12 +157,19 @@ agentssh file read --profile prod --remote /etc/config.ini
 # Read (JSON with metadata)
 agentssh --json file read --profile prod --remote /etc/config.ini
 
-# Edit (find and replace)
+# Edit (literal find/replace)
 agentssh file edit --profile prod --remote /etc/config.ini \
   --find "port=8080" --replace "port=9090"
 
+# Edit (regex)
+agentssh file edit --profile prod --remote /etc/config.ini \
+  --find "port=\\d+" --replace "port=9090" --regex
+
 # Delete
 agentssh file delete --profile prod --remote /tmp/old.log
+
+# Delete (recursive)
+agentssh file delete --profile prod --remote /tmp/build --recursive
 ```
 
 `file read` without `--json` prints the file content directly — no JSON wrapping, no \n escaping.
@@ -197,9 +204,9 @@ agentssh --json session exec --session-id s1 --timeout 60000 -- "dnf install ngi
 ```
 
 Use `session exec` for commands where you need structured output. No shell
-prompt garbage, no ANSI codes. This is the preferred way to run commands in a
-session. Works on sessions created by `connect` — reuses the same SSH
-connection without PTY interference.
+prompt garbage, no ANSI codes. Opens a dedicated SSH connection using the
+session's stored credentials — no PTY channel conflict. For maximum speed
+on repeated commands, use one-shot `exec` with `AGENTSSH_DEFAULT_PROFILE`.
 
 **Send input into the PTY (interactive mode):**
 
@@ -452,6 +459,10 @@ agentssh --json exec --profile <p> --timeout 30000 -- <cmd>
 agentssh --json file ls --profile <p> --remote <path>
 agentssh file upload --profile <p> --local <l> --remote <r>
 agentssh file download --profile <p> --remote <r> --local <l>
+agentssh file write --profile <p> --remote <r> --content <c> [--append]
+agentssh file read --profile <p> --remote <r>
+agentssh file edit --profile <p> --remote <r> --find <f> --replace <r> [--regex]
+agentssh file delete --profile <p> --remote <r> [--recursive]
 
 # Sessions
 agentssh connect --profile <p> --reconnect
