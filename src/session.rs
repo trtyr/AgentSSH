@@ -322,6 +322,9 @@ pub fn daemon_exec(command: SessionExecCommand, state: &mut ServerState) -> Resu
     let connection_id = {
         let session = get_session_mut(state, &command.session_id)?;
         ensure_session_connected(session)?;
+        // Drain PTY output before channel operations — the PTY may have
+        // pending data that causes EAGAIN on the shared SSH transport.
+        refresh_session_state(session);
         session.connection_id.clone()
     };
     let connection = get_connection_mut(state, &connection_id)?;

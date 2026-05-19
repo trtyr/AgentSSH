@@ -189,7 +189,22 @@ pub fn exec_channel(
     command_line: &str,
     timeout: Option<u64>,
 ) -> Result<(String, String, i32)> {
-    channel.exec(command_line)?;
+    // channel.exec() may return EAGAIN (-37) when the SSH transport has
+    // pending data from other channels (e.g. a PTY from `connect`). Retry.
+    let start = std::time::Instant::now();
+    loop {
+        match channel.exec(command_line) {
+            Ok(()) => break,
+            Err(e) if e.code() == ssh2::ErrorCode::Session(-37) => {
+                if start.elapsed().as_millis() > 5000 {
+                    return Err(anyhow::Error::from(e)
+                        .context("exec timed out after 5s — transport may be stalled"));
+                }
+                sleep_ms(100);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 
     if timeout.is_none() {
         session.set_blocking(true);
