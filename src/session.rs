@@ -326,11 +326,30 @@ pub fn daemon_exec(command: SessionExecCommand, state: &mut ServerState) -> Resu
     };
     let connection = get_connection_mut(state, &connection_id)?;
 
-    // Must set blocking before opening a new channel — the daemon keeps
-    // the SSH session non-blocking for async PTY I/O.
-    connection.ssh.set_blocking(true);
     let command_line = command.command.join(" ");
-    let mut channel = connection.ssh.channel_session()?;
+
+    // The daemon keeps the SSH transport non-blocking for async PTY I/O.
+    // channel_session() may return EAGAIN (-37) when the transport has
+    // pending data from the active PTY channel. Retry with backoff.
+    let mut channel = {
+        let start = std::time::Instant::now();
+        loop {
+            match connection.ssh.channel_session() {
+                Ok(ch) => break ch,
+                Err(e) if e.code() == ssh2::ErrorCode::Session(-37) => {
+                    if start.elapsed().as_millis() > 5000 {
+                        return Err(anyhow::Error::from(e)
+                            .context("channel open timed out after 5s — transport may be stalled"));
+                    }
+                    sleep_ms(100);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    };
+
+    // Switch to blocking for the exec itself
+    connection.ssh.set_blocking(true);
     let (stdout, stderr, exit_status) =
         exec_channel(&connection.ssh, &mut channel, &command_line, command.timeout)?;
     connection.ssh.set_blocking(false);
