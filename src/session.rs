@@ -327,40 +327,14 @@ pub fn daemon_exec(command: SessionExecCommand, state: &mut ServerState) -> Resu
     };
 
     let command_line = command.command.join(" ");
-
-    // Retry loop: each iteration gets a fresh connection borrow,
-    // opens a channel, and on EAGAIN drains PTY output before retrying.
-    // The PTY channel from `connect` continuously receives data — if we
-    // don't drain between retries, the SSH transport stays congested.
-    let mut channel = {
-        let start = std::time::Instant::now();
-        loop {
-            let result = {
-                let connection = get_connection_mut(state, &connection_id)?;
-                connection.ssh.channel_session()
-            };
-            match result {
-                Ok(ch) => break ch,
-                Err(e) if e.code() == ssh2::ErrorCode::Session(-37) => {
-                    if start.elapsed().as_millis() > 5000 {
-                        return Err(anyhow::Error::from(e)
-                            .context("channel open timed out after 5s — transport may be stalled"));
-                    }
-                    // Drain PTY between retries — connection borrow is released above
-                    {
-                        let session = get_session_mut(state, &command.session_id)?;
-                        refresh_session_state(session);
-                    }
-                    sleep_ms(100);
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-    };
-
-    // Switch to blocking for the exec itself
     let connection = get_connection_mut(state, &connection_id)?;
+
+    // Set blocking before channel_session() — the daemon normally keeps
+    // the transport non-blocking for async PTY I/O, but channel_session()
+    // needs blocking mode because libssh2 must process intermixed SSH
+    // data from the active PTY channel during the OPEN handshake.
     connection.ssh.set_blocking(true);
+    let mut channel = connection.ssh.channel_session()?;
     let (stdout, stderr, exit_status) =
         exec_channel(&connection.ssh, &mut channel, &command_line, command.timeout)?;
     connection.ssh.set_blocking(false);
