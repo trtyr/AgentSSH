@@ -319,25 +319,22 @@ pub fn daemon_spawn(command: SpawnCommand, state: &mut ServerState) -> Result<Va
 }
 
 pub fn daemon_exec(command: SessionExecCommand, state: &mut ServerState) -> Result<Value> {
-    let connection_id = {
+    // Get the session's stored ConnectArgs to open a dedicated connection.
+    // The session's SSH transport has an active PTY channel (from `connect`)
+    // that conflicts with opening new channels via libssh2. A fresh connection
+    // eliminates the channel conflict at the cost of one extra TCP handshake
+    // (~500ms), which is negligible compared to command execution time.
+    let connect_args = {
         let session = get_session_mut(state, &command.session_id)?;
         ensure_session_connected(session)?;
-        refresh_session_state(session);
-        session.connection_id.clone()
+        session.connect_args.clone()
     };
 
+    let (ssh, _host, _port, _username) = connect_with_info(connect_args)?;
     let command_line = command.command.join(" ");
-    let connection = get_connection_mut(state, &connection_id)?;
-
-    // Set blocking before channel_session() — the daemon normally keeps
-    // the transport non-blocking for async PTY I/O, but channel_session()
-    // needs blocking mode because libssh2 must process intermixed SSH
-    // data from the active PTY channel during the OPEN handshake.
-    connection.ssh.set_blocking(true);
-    let mut channel = connection.ssh.channel_session()?;
+    let mut channel = ssh.channel_session()?;
     let (stdout, stderr, exit_status) =
-        exec_channel(&connection.ssh, &mut channel, &command_line, command.timeout)?;
-    connection.ssh.set_blocking(false);
+        exec_channel(&ssh, &mut channel, &command_line, command.timeout)?;
 
     Ok(serde_json::json!({
         "session_id": command.session_id,
