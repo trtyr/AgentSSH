@@ -139,6 +139,31 @@ agentssh --json file ls --profile prod --remote /var/www
 File transfer auto-negotiates protocol: SFTP → SCP → exec (base64 for
 Windows). Force a method with `--method sftp` or `--method scp`.
 
+**Direct file operations (read/write/edit/delete):**
+
+```bash
+# Write (overwrite)
+agentssh file write --profile prod --remote /etc/config.ini --content "[app]\nport=8080\n"
+
+# Write (append)
+agentssh file write --profile prod --remote /var/log/app.log --content "new entry\n" --append
+
+# Read (plain text, no --json needed)
+agentssh file read --profile prod --remote /etc/config.ini
+
+# Read (JSON with metadata)
+agentssh --json file read --profile prod --remote /etc/config.ini
+
+# Edit (find and replace)
+agentssh file edit --profile prod --remote /etc/config.ini \
+  --find "port=8080" --replace "port=9090"
+
+# Delete
+agentssh file delete --profile prod --remote /tmp/old.log
+```
+
+`file read` without `--json` prints the file content directly — no JSON wrapping, no \n escaping.
+
 ### Tier 2: Long-lived sessions (daemon-backed)
 
 Sessions keep an SSH connection alive. You can send multiple commands into the
@@ -160,6 +185,7 @@ glitches — the daemon reconnects automatically.
 **Run a clean command (no PTY noise):**
 
 ```bash
+# Works on any session, including connect-created sessions
 agentssh --json session exec --session-id s1 -- <command>
 # Returns clean {"exit_status": n, "stdout": "...", "stderr": ""}
 
@@ -169,7 +195,8 @@ agentssh --json session exec --session-id s1 --timeout 60000 -- "dnf install ngi
 
 Use `session exec` for commands where you need structured output. No shell
 prompt garbage, no ANSI codes. This is the preferred way to run commands in a
-session.
+session. Works on sessions created by `connect` — reuses the same SSH
+connection without PTY interference.
 
 **Send input into the PTY (interactive mode):**
 

@@ -326,6 +326,9 @@ pub fn daemon_exec(command: SessionExecCommand, state: &mut ServerState) -> Resu
     };
     let connection = get_connection_mut(state, &connection_id)?;
 
+    // Must set blocking before opening a new channel — the daemon keeps
+    // the SSH session non-blocking for async PTY I/O.
+    connection.ssh.set_blocking(true);
     let command_line = command.command.join(" ");
     let mut channel = connection.ssh.channel_session()?;
     let (stdout, stderr, exit_status) =

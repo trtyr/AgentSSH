@@ -348,6 +348,13 @@ fn print_human(data: Value) -> Result<()> {
         }
         return Ok(());
     }
+    // Case 3: file read response — print content directly
+    if let Some(content) = data.get("content").and_then(Value::as_str) {
+        if !content.is_empty() {
+            print!("{content}");
+        }
+        return Ok(());
+    }
     // Fallback: pretty-print JSON
     println!("{}", serde_json::to_string_pretty(&data)?);
     Ok(())

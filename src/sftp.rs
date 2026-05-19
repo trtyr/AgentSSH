@@ -334,11 +334,11 @@ fn ls_with_method(session: &ssh2::Session, command: &ListCommand, session_id: Op
 }
 
 fn write_with_method(session: &ssh2::Session, command: &WriteCommand, session_id: Option<&str>) -> Result<Value> {
-    sftp_write(session, &command.remote, &command.content, session_id).or_else(|sftp_error| {
+    sftp_write(session, &command.remote, &command.content, session_id, command.append).or_else(|sftp_error| {
         if !is_sftp_error(&sftp_error) {
             return Err(sftp_error);
         }
-        exec_write(session, &command.remote, &command.content, session_id)
+        exec_write(session, &command.remote, &command.content, session_id, command.append)
             .with_context(|| format!("write fallback exhausted after SFTP error: {sftp_error}"))
     })
 }
@@ -538,17 +538,28 @@ fn exec_upload(session: &ssh2::Session, local: &Path, remote: &Path, session_id:
     Ok(transfer_result_json(local, remote, "exec", session_id))
 }
 
-fn sftp_write(session: &ssh2::Session, remote: &Path, content: &str, session_id: Option<&str>) -> Result<Value> {
+fn sftp_write(session: &ssh2::Session, remote: &Path, content: &str, session_id: Option<&str>, append: bool) -> Result<Value> {
     let sftp = session
         .sftp()
         .context("SFTP is not available on this server. The SSH server may not have the sftp subsystem enabled.")?;
-    sftp.create(remote)
-        .with_context(|| format!("create remote file {}", remote.display()))?
+    if append {
+        sftp.open_mode(
+            remote,
+            ssh2::OpenFlags::WRITE | ssh2::OpenFlags::APPEND | ssh2::OpenFlags::CREATE,
+            0o644,
+            ssh2::OpenType::File,
+        )
+        .with_context(|| format!("open remote file {} for append", remote.display()))?
         .write_all(content.as_bytes())?;
+    } else {
+        sftp.create(remote)
+            .with_context(|| format!("create remote file {}", remote.display()))?
+            .write_all(content.as_bytes())?;
+    }
     Ok(write_result_json(remote, content.len(), "sftp", session_id))
 }
 
-fn exec_write(session: &ssh2::Session, remote: &Path, content: &str, session_id: Option<&str>) -> Result<Value> {
+fn exec_write(session: &ssh2::Session, remote: &Path, content: &str, session_id: Option<&str>, append: bool) -> Result<Value> {
     session.set_blocking(true);
     let encoded = B64.encode(content.as_bytes());
     if encoded.len() >= EXEC_UPLOAD_BASE64_LIMIT {
@@ -558,7 +569,7 @@ fn exec_write(session: &ssh2::Session, remote: &Path, content: &str, session_id:
             EXEC_UPLOAD_BASE64_LIMIT
         ));
     }
-    let command = build_exec_upload_command(remote, &encoded)?;
+    let command = build_exec_write_command(remote, &encoded, append)?;
     exec_powershell(session, &command)
         .with_context(|| format!("exec write remote file {}", remote.display()))?;
     Ok(write_result_json(remote, content.len(), "exec", session_id))
@@ -650,6 +661,28 @@ fn build_exec_upload_command(remote: &Path, encoded: &str) -> Result<String> {
         powershell_single_quote(remote),
         encoded
     ))
+}
+
+fn build_exec_write_command(remote: &Path, encoded: &str, append: bool) -> Result<String> {
+    if encoded.len() >= EXEC_UPLOAD_BASE64_LIMIT {
+        return Err(anyhow!(
+            "exec write payload too large: base64 length {} exceeds limit {}",
+            encoded.len(),
+            EXEC_UPLOAD_BASE64_LIMIT
+        ));
+    }
+
+    if append {
+        Ok(format!(
+            "$b=[Convert]::FromBase64String('{encoded}');$f=[IO.File]::Open({},[IO.FileMode]::Append);$f.Write($b,0,$b.Length);$f.Close()",
+            powershell_single_quote(remote)
+        ))
+    } else {
+        Ok(format!(
+            "[IO.File]::WriteAllBytes({}, [Convert]::FromBase64String('{encoded}'))",
+            powershell_single_quote(remote)
+        ))
+    }
 }
 
 fn build_exec_download_command(remote: &Path) -> String {

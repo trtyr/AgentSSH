@@ -382,6 +382,9 @@ pub struct WriteCommand {
     pub remote: PathBuf,
     #[arg(long)]
     pub content: String,
+    /// Append to file instead of overwriting
+    #[arg(long, default_value_t = false)]
+    pub append: bool,
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
