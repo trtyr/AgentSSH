@@ -322,27 +322,34 @@ pub fn daemon_exec(command: SessionExecCommand, state: &mut ServerState) -> Resu
     let connection_id = {
         let session = get_session_mut(state, &command.session_id)?;
         ensure_session_connected(session)?;
-        // Drain PTY output before channel operations — the PTY may have
-        // pending data that causes EAGAIN on the shared SSH transport.
         refresh_session_state(session);
         session.connection_id.clone()
     };
-    let connection = get_connection_mut(state, &connection_id)?;
 
     let command_line = command.command.join(" ");
 
-    // The daemon keeps the SSH transport non-blocking for async PTY I/O.
-    // channel_session() may return EAGAIN (-37) when the transport has
-    // pending data from the active PTY channel. Retry with backoff.
+    // Retry loop: each iteration gets a fresh connection borrow,
+    // opens a channel, and on EAGAIN drains PTY output before retrying.
+    // The PTY channel from `connect` continuously receives data — if we
+    // don't drain between retries, the SSH transport stays congested.
     let mut channel = {
         let start = std::time::Instant::now();
         loop {
-            match connection.ssh.channel_session() {
+            let result = {
+                let connection = get_connection_mut(state, &connection_id)?;
+                connection.ssh.channel_session()
+            };
+            match result {
                 Ok(ch) => break ch,
                 Err(e) if e.code() == ssh2::ErrorCode::Session(-37) => {
                     if start.elapsed().as_millis() > 5000 {
                         return Err(anyhow::Error::from(e)
                             .context("channel open timed out after 5s — transport may be stalled"));
+                    }
+                    // Drain PTY between retries — connection borrow is released above
+                    {
+                        let session = get_session_mut(state, &command.session_id)?;
+                        refresh_session_state(session);
                     }
                     sleep_ms(100);
                 }
@@ -352,6 +359,7 @@ pub fn daemon_exec(command: SessionExecCommand, state: &mut ServerState) -> Resu
     };
 
     // Switch to blocking for the exec itself
+    let connection = get_connection_mut(state, &connection_id)?;
     connection.ssh.set_blocking(true);
     let (stdout, stderr, exit_status) =
         exec_channel(&connection.ssh, &mut channel, &command_line, command.timeout)?;
