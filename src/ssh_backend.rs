@@ -1,5 +1,6 @@
 use crate::cli::{ConnectArgs, ExecCommand};
 use crate::connection::connect_with_info;
+use crate::connection::exec_channel;
 use crate::util::print_json;
 use anyhow::{Result, bail};
 use std::io::{self, Read, Write};
@@ -35,13 +36,8 @@ pub fn run_exec(command: ExecCommand, json: bool) -> Result<()> {
     let (session, _, _, _) = connect_with_info(command.connect)?;
     let command_line = command.command.join(" ");
     let mut channel = session.channel_session()?;
-    channel.exec(&command_line)?;
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    channel.read_to_string(&mut stdout)?;
-    channel.stderr().read_to_string(&mut stderr)?;
-    channel.wait_close()?;
-    let exit_status = channel.exit_status()?;
+    let (stdout, stderr, exit_status) =
+        exec_channel(&session, &mut channel, &command_line, command.timeout)?;
     if json {
         print_json(
             &serde_json::json!({ "exit_status": exit_status, "stdout": stdout, "stderr": stderr }),

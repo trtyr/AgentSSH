@@ -322,13 +322,34 @@ fn write_wire(stream: &mut UnixStream, result: Result<Value>) -> Result<()> {
 }
 
 fn print_human(data: Value) -> Result<()> {
+    // Case 1: session read output — extract /output/text
     if let Some(output) = data.pointer("/output/text").and_then(Value::as_str) {
         if !output.is_empty() {
             println!("{output}");
         }
-    } else {
-        println!("{}", serde_json::to_string_pretty(&data)?);
+        return Ok(());
     }
+    // Case 2: exec-style response — print stdout/stderr directly
+    if data.get("stdout").is_some() || data.get("exit_status").is_some() {
+        if let Some(stdout) = data.get("stdout").and_then(Value::as_str) {
+            if !stdout.is_empty() {
+                print!("{stdout}");
+            }
+        }
+        if let Some(stderr) = data.get("stderr").and_then(Value::as_str) {
+            if !stderr.is_empty() {
+                eprint!("{stderr}");
+            }
+        }
+        if let Some(exit_status) = data.get("exit_status").and_then(Value::as_i64) {
+            if exit_status != 0 {
+                bail!("remote command exited with status {exit_status}");
+            }
+        }
+        return Ok(());
+    }
+    // Fallback: pretty-print JSON
+    println!("{}", serde_json::to_string_pretty(&data)?);
     Ok(())
 }
 

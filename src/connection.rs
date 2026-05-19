@@ -3,7 +3,8 @@ use crate::kernel::ServerState;
 use crate::profile::read_profiles;
 use crate::util::{DEFAULT_PORT, DEFAULT_READY_TIMEOUT_MS, expand_home, sleep_ms};
 use anyhow::{Context, Result, anyhow, bail};
-use ssh2::Session;
+use ssh2::{Channel, Session};
+use std::io::Read;
 use std::net::TcpStream;
 
 pub struct SessionIdentity {
@@ -33,7 +34,10 @@ pub fn get_connection_mut<'a>(
 }
 
 pub fn connect_with_info(mut args: ConnectArgs) -> Result<(Session, String, u16, String)> {
-    if let Some(profile_name) = args.profile.clone() {
+    let profile_name = args.profile.clone().or_else(|| {
+        std::env::var("AGENTSSH_DEFAULT_PROFILE").ok()
+    });
+    if let Some(profile_name) = profile_name {
         let profile = read_profiles()?
             .profiles
             .get(&profile_name)
@@ -170,6 +174,72 @@ pub fn passphrase(args: &ConnectArgs) -> Result<Option<String>> {
         return Ok(Some(std::env::var(name).with_context(|| format!("read env {name}"))?));
     }
     Ok(None)
+}
+
+/// Execute a command on a channel, optionally with a timeout.
+/// When timeout is None, uses blocking reads (original behavior).
+/// When timeout is Some(ms), uses non-blocking polling and returns
+/// an error if the command exceeds the timeout.
+///
+/// The session's blocking mode is modified by this function.
+/// Callers should restore the desired blocking mode after this returns.
+pub fn exec_channel(
+    session: &Session,
+    channel: &mut Channel,
+    command_line: &str,
+    timeout: Option<u64>,
+) -> Result<(String, String, i32)> {
+    channel.exec(command_line)?;
+
+    if timeout.is_none() {
+        session.set_blocking(true);
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        channel.read_to_string(&mut stdout)?;
+        channel.stderr().read_to_string(&mut stderr)?;
+        channel.wait_close()?;
+        let exit_status = channel.exit_status()?;
+        return Ok((stdout, stderr, exit_status));
+    }
+
+    let timeout_ms = timeout.unwrap();
+    session.set_blocking(false);
+
+    let mut stdout = Vec::new();
+    let start = std::time::Instant::now();
+    let mut buf = [0u8; 8192];
+
+    loop {
+        let elapsed = start.elapsed().as_millis();
+        if elapsed > timeout_ms as u128 {
+            let _ = channel.close();
+            bail!("command timed out after {timeout_ms}ms");
+        }
+
+        match channel.read(&mut buf) {
+            Ok(0) if channel.eof() => break,
+            Ok(0) => {}
+            Ok(n) => {
+                stdout.extend_from_slice(&buf[..n]);
+                continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        sleep_ms(100);
+    }
+
+    let mut stderr = String::new();
+    channel.stderr().read_to_string(&mut stderr)?;
+    channel.wait_close()?;
+    let exit_status = channel.exit_status()?;
+
+    Ok((
+        String::from_utf8_lossy(&stdout).into_owned(),
+        stderr,
+        exit_status,
+    ))
 }
 
 #[cfg(test)]

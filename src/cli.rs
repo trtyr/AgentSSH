@@ -205,6 +205,9 @@ pub struct ExecCommand {
     pub connect: ConnectArgs,
     #[arg(required = true, trailing_var_arg = true)]
     pub command: Vec<String>,
+    /// Command execution timeout in milliseconds
+    #[arg(long)]
+    pub timeout: Option<u64>,
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
@@ -338,6 +341,9 @@ pub struct SessionExecCommand {
     pub session_id: String,
     #[arg(required = true, trailing_var_arg = true)]
     pub command: Vec<String>,
+    /// Command execution timeout in milliseconds
+    #[arg(long)]
+    pub timeout: Option<u64>,
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]

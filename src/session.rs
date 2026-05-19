@@ -1,5 +1,5 @@
 use crate::cli::{ConnectArgs, ConnectCommand, ReadCommand, ResizeCommand, SessionExecCommand, SessionInputCommand, SignalCommand, SpawnCommand};
-use crate::connection::{SessionIdentity, SharedConnection, connect_with_info, get_connection_mut, next_connection_id};
+use crate::connection::{SessionIdentity, SharedConnection, connect_with_info, exec_channel, get_connection_mut, next_connection_id};
 use crate::interactive::output_matches;
 use crate::kernel::ServerState;
 use crate::util::{MAX_BUFFER, log_daemon, now_ms, sleep_ms, strip_ansi};
@@ -326,16 +326,10 @@ pub fn daemon_exec(command: SessionExecCommand, state: &mut ServerState) -> Resu
     };
     let connection = get_connection_mut(state, &connection_id)?;
 
-    connection.ssh.set_blocking(true);
     let command_line = command.command.join(" ");
     let mut channel = connection.ssh.channel_session()?;
-    channel.exec(&command_line)?;
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    channel.read_to_string(&mut stdout)?;
-    channel.stderr().read_to_string(&mut stderr)?;
-    channel.wait_close()?;
-    let exit_status = channel.exit_status()?;
+    let (stdout, stderr, exit_status) =
+        exec_channel(&connection.ssh, &mut channel, &command_line, command.timeout)?;
     connection.ssh.set_blocking(false);
 
     Ok(serde_json::json!({

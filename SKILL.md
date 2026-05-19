@@ -68,15 +68,26 @@ agentssh exec --profile prod --host emergency.example.com -- uptime
 # inline --host wins over profile
 ```
 
-## Always use --json
+**Set a default profile** to skip `--profile` on every command:
+```bash
+export AGENTSSH_DEFAULT_PROFILE=prod
+agentssh --json exec -- uptime  # --profile inferred from env var
+```
+Inline `--profile` still overrides the default.
 
-**Every agentssh command supports `--json` (before the subcommand).** Use it
-always. It gives you structured output you can parse.
+## Output modes
+
+agentssh supports two output modes for `exec` and `session exec`:
+
+- **`--json`** (recommended for agents): structured JSON — `{"exit_status": 0, "stdout": "...", "stderr": ""}`
+- **No `--json`** (for humans): prints stdout directly, stderr to stderr. Non-zero exit code produces an error.
 
 ```bash
-agentssh --json exec --profile prod -- uname -a
-# {"ok":true,"data":{"exit_status":0,"stdout":"Linux ...\n","stderr":""}}
+agentssh exec --profile prod -- ls            # plain text output
+agentssh --json exec --profile prod -- ls     # JSON output
 ```
+
+All other commands (`session read`, `session list`, etc.) still require `--json` for structured output.
 
 ## Command reference
 
@@ -91,6 +102,7 @@ agentssh exec --profile <name> -- <command> [args...]
 agentssh --json exec --profile prod -- uptime
 agentssh --json exec --profile prod -- docker ps
 agentssh --json exec --profile prod --retry 3 -- systemctl status nginx
+agentssh --json exec --profile prod --timeout 30000 -- "long_running_script.sh"
 ```
 
 Output: `{"exit_status": <int>, "stdout": "<string>", "stderr": "<string>"}`.
@@ -150,6 +162,9 @@ glitches — the daemon reconnects automatically.
 ```bash
 agentssh --json session exec --session-id s1 -- <command>
 # Returns clean {"exit_status": n, "stdout": "...", "stderr": ""}
+
+# With timeout (milliseconds):
+agentssh --json session exec --session-id s1 --timeout 60000 -- "dnf install nginx"
 ```
 
 Use `session exec` for commands where you need structured output. No shell
@@ -395,9 +410,12 @@ Use `--raw` on `session send` or `session read` to get unmodified PTY output.
 agentssh profile add <name> --host <h> --username <u>
 agentssh profile list
 agentssh profile delete <name>
+# Set default profile to avoid repeating --profile
+export AGENTSSH_DEFAULT_PROFILE=my-server
 
 # One-shot
 agentssh --json exec --profile <p> -- <cmd>
+agentssh --json exec --profile <p> --timeout 30000 -- <cmd>
 agentssh --json file ls --profile <p> --remote <path>
 agentssh file upload --profile <p> --local <l> --remote <r>
 agentssh file download --profile <p> --remote <r> --local <l>
@@ -405,6 +423,7 @@ agentssh file download --profile <p> --remote <r> --local <l>
 # Sessions
 agentssh connect --profile <p> --reconnect
 agentssh --json session exec --session-id <id> -- <cmd>
+agentssh --json session exec --session-id <id> --timeout 60000 -- <cmd>
 agentssh session send --session-id <id> --input "<text>"
 agentssh --json session read --session-id <id> [--follow]
 agentssh session spawn --from <id>
