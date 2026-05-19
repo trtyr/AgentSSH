@@ -80,11 +80,14 @@ Inline `--profile` still overrides the default.
 agentssh supports two output modes for `exec` and `session exec`:
 
 - **`--json`** (recommended for agents): structured JSON — `{"exit_status": 0, "stdout": "...", "stderr": ""}`
-- **No `--json`** (for humans): prints stdout directly, stderr to stderr. Non-zero exit code produces an error.
+- **`--output json`** (same as `--json`)
+- **No flag** / **`--output text`** (for humans): prints stdout directly, stderr to stderr. Non-zero exit code produces an error.
 
 ```bash
-agentssh exec --profile prod -- ls            # plain text output
-agentssh --json exec --profile prod -- ls     # JSON output
+agentssh exec --profile prod -- ls              # plain text output (default)
+agentssh exec --profile prod --output text -- ls # explicit plain text
+agentssh --json exec --profile prod -- ls        # JSON output
+agentssh exec --profile prod --output json -- ls # explicit JSON
 ```
 
 All other commands (`session read`, `session list`, etc.) still require `--json` for structured output.
@@ -439,6 +442,9 @@ agentssh profile list
 agentssh profile delete <name>
 # Set default profile to avoid repeating --profile
 export AGENTSSH_DEFAULT_PROFILE=my-server
+# Explicit output format control
+agentssh --json exec --profile prod -- <cmd>
+agentssh --output text exec --profile prod -- <cmd>
 
 # One-shot
 agentssh --json exec --profile <p> -- <cmd>

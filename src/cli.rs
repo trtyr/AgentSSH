@@ -2,7 +2,7 @@ use crate::kernel;
 use crate::profile;
 use crate::protocol::WireRequest;
 use crate::ssh_backend;
-use crate::util::{DEFAULT_COLS, DEFAULT_LIMIT, DEFAULT_ROWS, DEFAULT_WAIT_MS};
+use crate::util::{DEFAULT_COLS, DEFAULT_LIMIT, DEFAULT_ROWS, DEFAULT_WAIT_MS, OutputFormat};
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -13,11 +13,25 @@ use std::path::PathBuf;
 #[command(about = "SSH toolkit for AI agents")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 pub struct Cli {
-    #[arg(long, global = true)]
+    /// Output JSON (legacy, use --output json instead)
+    #[arg(long, global = true, conflicts_with = "output")]
     pub json: bool,
+    /// Output format: json or text (default: text)
+    #[arg(long, global = true, value_enum, conflicts_with = "json")]
+    pub output: Option<OutputFormat>,
 
     #[command(subcommand)]
     pub command: Command,
+}
+
+impl Cli {
+    pub fn effective_json(&self) -> bool {
+        match self.output {
+            Some(OutputFormat::Json) => true,
+            Some(OutputFormat::Text) => false,
+            None => self.json,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -456,91 +470,92 @@ pub struct ProxyPingCommand {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    let json = cli.effective_json();
     match cli.command {
-        Command::Exec(command) => ssh_backend::run_exec(command, cli.json),
-        Command::Shell(connect) => ssh_backend::run_shell(connect, cli.json),
-        Command::Connect(command) => kernel::run_client(WireRequest::Connect(command), cli.json),
+        Command::Exec(command) => ssh_backend::run_exec(command, json),
+        Command::Shell(connect) => ssh_backend::run_shell(connect, json),
+        Command::Connect(command) => kernel::run_client(WireRequest::Connect(command), json),
         Command::Session(group) => match group.command {
-            SessionCommand::Send(command) => kernel::run_client(WireRequest::Send(command), cli.json),
-            SessionCommand::Exec(command) => kernel::run_client(WireRequest::Exec(command), cli.json),
+            SessionCommand::Send(command) => kernel::run_client(WireRequest::Send(command), json),
+            SessionCommand::Exec(command) => kernel::run_client(WireRequest::Exec(command), json),
             SessionCommand::Spawn(command) => {
-                kernel::run_client(WireRequest::Spawn(command), cli.json)
+                kernel::run_client(WireRequest::Spawn(command), json)
             }
-            SessionCommand::Read(command) => kernel::run_read_command(command, cli.json),
+            SessionCommand::Read(command) => kernel::run_read_command(command, json),
             SessionCommand::Resize(command) => {
-                kernel::run_client(WireRequest::Resize(command), cli.json)
+                kernel::run_client(WireRequest::Resize(command), json)
             }
             SessionCommand::Signal(command) => {
-                kernel::run_client(WireRequest::Signal(command), cli.json)
+                kernel::run_client(WireRequest::Signal(command), json)
             }
             SessionCommand::Status(command) => {
-                kernel::run_client(WireRequest::Status(command), cli.json)
+                kernel::run_client(WireRequest::Status(command), json)
             }
-            SessionCommand::Ping(command) => kernel::run_client(WireRequest::Ping(command), cli.json),
-            SessionCommand::List => kernel::run_client(WireRequest::List, cli.json),
-            SessionCommand::Close(command) => kernel::run_client(WireRequest::Close(command), cli.json),
+            SessionCommand::Ping(command) => kernel::run_client(WireRequest::Ping(command), json),
+            SessionCommand::List => kernel::run_client(WireRequest::List, json),
+            SessionCommand::Close(command) => kernel::run_client(WireRequest::Close(command), json),
         },
         Command::File(group) => match group.command {
             FileCommand::Upload(command) => {
                 if command.session_id.is_some() {
-                    kernel::run_client(WireRequest::Upload(command), cli.json)
+                    kernel::run_client(WireRequest::Upload(command), json)
                 } else {
-                    ssh_backend::run_upload_once(command, cli.json)
+                    ssh_backend::run_upload_once(command, json)
                 }
             }
             FileCommand::Download(command) => {
                 if command.session_id.is_some() {
-                    kernel::run_client(WireRequest::Download(command), cli.json)
+                    kernel::run_client(WireRequest::Download(command), json)
                 } else {
-                    ssh_backend::run_download_once(command, cli.json)
+                    ssh_backend::run_download_once(command, json)
                 }
             }
             FileCommand::Ls(command) => {
                 if command.session_id.is_some() {
-                    kernel::run_client(WireRequest::Ls(command), cli.json)
+                    kernel::run_client(WireRequest::Ls(command), json)
                 } else {
-                    ssh_backend::run_ls_once(command, cli.json)
+                    ssh_backend::run_ls_once(command, json)
                 }
             }
             FileCommand::Write(command) => {
                 if command.session_id.is_some() {
-                    kernel::run_client(WireRequest::Write(command), cli.json)
+                    kernel::run_client(WireRequest::Write(command), json)
                 } else {
-                    ssh_backend::run_write_once(command, cli.json)
+                    ssh_backend::run_write_once(command, json)
                 }
             }
             FileCommand::Read(command) => {
                 if command.session_id.is_some() {
-                    kernel::run_client(WireRequest::ReadFile(command), cli.json)
+                    kernel::run_client(WireRequest::ReadFile(command), json)
                 } else {
-                    ssh_backend::run_read_once(command, cli.json)
+                    ssh_backend::run_read_once(command, json)
                 }
             }
             FileCommand::Delete(command) => {
                 if command.session_id.is_some() {
-                    kernel::run_client(WireRequest::DeleteFile(command), cli.json)
+                    kernel::run_client(WireRequest::DeleteFile(command), json)
                 } else {
-                    ssh_backend::run_delete_once(command, cli.json)
+                    ssh_backend::run_delete_once(command, json)
                 }
             }
             FileCommand::Edit(command) => {
                 if command.session_id.is_some() {
-                    kernel::run_client(WireRequest::EditFile(command), cli.json)
+                    kernel::run_client(WireRequest::EditFile(command), json)
                 } else {
-                    ssh_backend::run_edit_once(command, cli.json)
+                    ssh_backend::run_edit_once(command, json)
                 }
             }
         },
         Command::Proxy(group) => match group.command {
-            ProxyCommand::Create(command) => kernel::run_client(WireRequest::ProxyCreate(command), cli.json),
-            ProxyCommand::List => kernel::run_client(WireRequest::ProxyList, cli.json),
-            ProxyCommand::Close(command) => kernel::run_client(WireRequest::ProxyClose(command), cli.json),
-            ProxyCommand::Ping(command) => kernel::run_client(WireRequest::ProxyPing(command), cli.json),
+            ProxyCommand::Create(command) => kernel::run_client(WireRequest::ProxyCreate(command), json),
+            ProxyCommand::List => kernel::run_client(WireRequest::ProxyList, json),
+            ProxyCommand::Close(command) => kernel::run_client(WireRequest::ProxyClose(command), json),
+            ProxyCommand::Ping(command) => kernel::run_client(WireRequest::ProxyPing(command), json),
         },
-        Command::Profile(command) => profile::run_profile(command, cli.json),
+        Command::Profile(command) => profile::run_profile(command, json),
         Command::Daemon(group) => match group.command {
             DaemonCommand::Serve => kernel::run_server(),
-            DaemonCommand::Shutdown => kernel::run_client(WireRequest::Shutdown, cli.json),
+            DaemonCommand::Shutdown => kernel::run_client(WireRequest::Shutdown, json),
         },
     }
 }

@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use clap::ValueEnum;
 use serde::Serialize;
 use serde_json::Value;
 use ssh2::FileStat;
@@ -15,6 +16,14 @@ pub const DEFAULT_ROWS: u32 = 40;
 pub const DEFAULT_LIMIT: usize = 8_000;
 pub const DEFAULT_WAIT_MS: u64 = 250;
 pub const MAX_BUFFER: usize = 1_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    /// Structured JSON output (same as --json)
+    Json,
+    /// Plain text output — stdout to stdout, stderr to stderr
+    Text,
+}
 
 #[derive(Serialize)]
 pub struct JsonOutput<T: Serialize> {
