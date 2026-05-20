@@ -1,9 +1,14 @@
 ---
 name: agentssh
+version: 0.2.0
 description: |
   AI-agent SSH capability. Use when the agent needs to run commands on remote
   servers, transfer files, manage long-lived SSH sessions, or set up SSH
   tunnels. Wraps the agentssh CLI into a first-class agent capability.
+
+  All output (success AND error) is structured JSON when --json is active.
+  Short flags available: -p (profile), -H (host), -P (port), -u (username),
+  -s (session-id).
 
   Triggers: SSH into server, deploy to remote, check server status, scp/sftp
   file transfer, remote diagnostics, port forwarding, SOCKS5 proxy.
@@ -36,7 +41,7 @@ Three tiers of operations:
 
 | Tier | What | Persistent? | Use for... |
 |------|------|-------------|------------|
-| **One-shot** | `exec`, `file ls/upload/download` | No | Quick commands, file ops |
+| **One-shot** | `exec`, `file ls/upload/download/read/write/edit/delete` | No | Quick commands, file ops |
 | **Session** | `connect`, `session send/read/exec/spawn` | Yes | Interactive shells, stateful work |
 | **Proxy** | `proxy create` | Yes | Tunnels, SOCKS5 |
 
@@ -79,9 +84,18 @@ Inline `--profile` still overrides the default.
 
 agentssh supports two output modes for `exec` and `session exec`:
 
-- **`--json`** (recommended for agents): structured JSON — `{"exit_status": 0, "stdout": "...", "stderr": ""}`
+- **`--json`** (recommended for agents): structured JSON — `{"ok": true, "data": {"exit_status": 0, "stdout": "...", "stderr": ""}}`
 - **`--output json`** (same as `--json`)
 - **No flag** / **`--output text`** (for humans): prints stdout directly, stderr to stderr. Non-zero exit code produces an error.
+
+**All errors are also JSON when `--json` is active:**
+
+```json
+{"ok": false, "error": "command timed out after 30000ms"}
+{"ok": false, "error": "profile 'nonexistent' not found. Run 'agentssh profile list' to see saved profiles."}
+```
+
+You never need to check "is this JSON or plain text?" — when `--json` is passed, output is always valid JSON. Parse `ok` to determine success/failure.
 
 ```bash
 agentssh exec --profile prod -- ls              # plain text output (default)
@@ -109,6 +123,9 @@ agentssh --json exec --profile prod --timeout 30000 -- "long_running_script.sh"
 ```
 
 Output: `{"exit_status": <int>, "stdout": "<string>", "stderr": "<string>"}`.
+
+`exec` has a **default 30-second timeout**. Override with `--timeout <ms>`. When
+a command times out, `--json` output is `{"ok": false, "error": "command timed out after 30000ms"}`.
 
 Use `exec` when you need a single answer and don't need state. No daemon
 required — connects, runs, disconnects. Fast.
@@ -208,6 +225,17 @@ prompt garbage, no ANSI codes. Opens a dedicated SSH connection using the
 session's stored credentials — no PTY channel conflict. For maximum speed
 on repeated commands, use one-shot `exec` with `AGENTSSH_DEFAULT_PROFILE`.
 
+**Fire-and-forget with --detach:**
+
+```bash
+# Start a background service without waiting for it to finish
+agentssh --json session exec --session-id s1 --detach -- "nohup python app.py &"
+# → {"ok": true, "data": {"detached": true, "status": "dispatched"}}
+```
+
+`--detach` writes the command to the session's PTY and returns immediately.
+Useful for starting long-running services, background jobs, or daemons.
+
 **Send input into the PTY (interactive mode):**
 
 ```bash
@@ -270,6 +298,14 @@ agentssh proxy create --profile prod \
 # → proxy_id: p1
 # Now localhost:5432 → remote PostgreSQL
 
+# With a human-readable name (easier to identify later)
+agentssh proxy create --profile prod \
+  --local 127.0.0.1:5432 \
+  --remote 127.0.0.1:5432 \
+  --name pg-tunnel
+# → proxy_id: pg-tunnel
+```
+
 # Use the forwarded port
 psql -h 127.0.0.1 -p 5432 -U app
 ```
@@ -297,11 +333,16 @@ agentssh proxy close --all
 
 ```bash
 agentssh daemon shutdown    # stop the daemon (loses all sessions)
-agentssh daemon status      # check if running
+agentssh daemon status      # PID, uptime, active sessions/proxies
+agentssh daemon install     # install as systemd user service (Linux only)
+agentssh daemon uninstall   # remove the systemd service
 ```
 
 The daemon auto-starts when you run `connect`, `session`, or `proxy` commands.
 Only shut it down when you're completely done.
+
+`daemon status` returns JSON when `--json` is passed:
+`{"running": true, "pid": 12345, "uptime_seconds": 3600, "sessions": 2, "proxies": 1}`.
 
 ## Common workflows
 
@@ -396,11 +437,24 @@ SSH disconnects, or you interrupt.
 
 ## Error handling
 
-agentssh commands return structured JSON errors:
+When `--json` is active, **all output is JSON** — both success and failure:
 
 ```json
-{"ok": false, "error": "SSH authentication failed: ..."}
+// Success
+{"ok": true, "data": {"exit_status": 0, "stdout": "hello\n", "stderr": ""}}
+
+// Error — timeout
+{"ok": false, "error": "command timed out after 30000ms"}
+
+// Error — connection refused
+{"ok": false, "error": "failed to connect to 10.0.0.1:2222: Connection refused"}
+
+// Error — profile not found
+{"ok": false, "error": "profile 'nonexistent' not found. Run 'agentssh profile list' to see saved profiles."}
 ```
+
+**You never need to handle mixed JSON/text output.** Parse `ok` to determine
+success vs failure. No need to check "is this valid JSON?" — it always is.
 
 Common failures:
 - **Connection refused**: server unreachable or SSH port closed
@@ -449,37 +503,45 @@ agentssh profile list
 agentssh profile delete <name>
 # Set default profile to avoid repeating --profile
 export AGENTSSH_DEFAULT_PROFILE=my-server
+# Short flags: -p (profile), -H (host), -P (port), -u (username), -s (session-id)
+agentssh -p prod --json exec -- uptime
 # Explicit output format control
 agentssh --json exec --profile prod -- <cmd>
 agentssh --output text exec --profile prod -- <cmd>
 
-# One-shot
-agentssh --json exec --profile <p> -- <cmd>
-agentssh --json exec --profile <p> --timeout 30000 -- <cmd>
-agentssh --json file ls --profile <p> --remote <path>
-agentssh file upload --profile <p> --local <l> --remote <r>
-agentssh file download --profile <p> --remote <r> --local <l>
-agentssh file write --profile <p> --remote <r> --content <c> [--append]
-agentssh file read --profile <p> --remote <r>
-agentssh file edit --profile <p> --remote <r> --find <f> --replace <r> [--regex]
-agentssh file delete --profile <p> --remote <r> [--recursive]
+# One-shot (default 30s timeout)
+agentssh --json exec -p <profile> -- <cmd>
+agentssh --json exec -p <profile> --timeout 60000 -- <cmd>
+agentssh --json exec -p <profile> --retry 3 -- <cmd>
+agentssh --json file ls -p <profile> --remote <path>
+agentssh file upload -p <profile> --local <l> --remote <r>
+agentssh file download -p <profile> --remote <r> --local <l>
+agentssh file write -p <profile> --remote <r> --content <c> [--append]
+agentssh file read -p <profile> --remote <r>
+agentssh file edit -p <profile> --remote <r> --find <f> --replace <r> [--regex]
+agentssh file delete -p <profile> --remote <r> [--recursive]
 
 # Sessions
-agentssh connect --profile <p> --reconnect
-agentssh --json session exec --session-id <id> -- <cmd>
-agentssh --json session exec --session-id <id> --timeout 60000 -- <cmd>
-agentssh session send --session-id <id> --input "<text>"
-agentssh --json session read --session-id <id> [--follow]
+agentssh connect -p <profile> --reconnect
+agentssh --json session exec -s <id> -- <cmd>
+agentssh --json session exec -s <id> --timeout 60000 -- <cmd>
+agentssh --json session exec -s <id> --detach -- "background_job &"
+agentssh session send -s <id> --input "<text>"
+agentssh --json session read -s <id> [--follow]
 agentssh session spawn --from <id>
 agentssh --json session list
-agentssh --json session ping --session-id <id>
-agentssh session close --session-id <id>
+agentssh --json session ping -s <id>
+agentssh session close -s <id>
 
 # Proxy
-agentssh proxy create --profile <p> --local <l> --remote <r>
-agentssh proxy create --profile <p> --socks5 <addr>
+agentssh proxy create -p <profile> --local <l> --remote <r> [--name <name>]
+agentssh proxy create -p <profile> --socks5 <addr> [--name <name>]
+agentssh --json proxy list
 agentssh proxy close --all
 
 # Daemon
+agentssh daemon status
 agentssh daemon shutdown
+agentssh daemon install      # Linux only, systemd user service
+agentssh daemon uninstall    # Linux only
 ```
