@@ -187,7 +187,7 @@ pub fn exec_channel(
     session: &Session,
     channel: &mut Channel,
     command_line: &str,
-    timeout: Option<u64>,
+    timeout_ms: u64,
 ) -> Result<(String, String, i32)> {
     // channel.exec() may return EAGAIN (-37) when the SSH transport has
     // pending data from other channels (e.g. a PTY from `connect`). Retry.
@@ -206,18 +206,6 @@ pub fn exec_channel(
         }
     }
 
-    if timeout.is_none() {
-        session.set_blocking(true);
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        channel.read_to_string(&mut stdout)?;
-        channel.stderr().read_to_string(&mut stderr)?;
-        channel.wait_close()?;
-        let exit_status = channel.exit_status()?;
-        return Ok((stdout, stderr, exit_status));
-    }
-
-    let timeout_ms = timeout.unwrap();
     session.set_blocking(false);
 
     let mut stdout = Vec::new();

@@ -16,6 +16,7 @@ pub const DEFAULT_ROWS: u32 = 40;
 pub const DEFAULT_LIMIT: usize = 8_000;
 pub const DEFAULT_WAIT_MS: u64 = 250;
 pub const MAX_BUFFER: usize = 1_000_000;
+pub const DEFAULT_EXEC_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {

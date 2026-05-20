@@ -2,7 +2,7 @@ use crate::kernel;
 use crate::profile;
 use crate::protocol::WireRequest;
 use crate::ssh_backend;
-use crate::util::{DEFAULT_COLS, DEFAULT_LIMIT, DEFAULT_ROWS, DEFAULT_WAIT_MS, OutputFormat};
+use crate::util::{DEFAULT_COLS, DEFAULT_EXEC_TIMEOUT_MS, DEFAULT_LIMIT, DEFAULT_ROWS, DEFAULT_WAIT_MS, OutputFormat};
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -131,6 +131,12 @@ pub enum DaemonCommand {
     Serve,
     /// Stop the daemon and close all sessions
     Shutdown,
+    /// Show daemon status and active sessions
+    Status,
+    /// Install agentssh as a systemd user service (Linux only)
+    Install,
+    /// Uninstall the systemd user service
+    Uninstall,
 }
 
 #[derive(Args, Debug)]
@@ -185,13 +191,17 @@ pub enum ProfileAction {
 
 #[derive(Args, Clone, Serialize, Deserialize, Default, Debug)]
 pub struct ConnectArgs {
-    #[arg(long)]
+    /// Connection profile name
+    #[arg(short = 'p', long)]
     pub profile: Option<String>,
-    #[arg(long)]
+    /// Remote hostname
+    #[arg(short = 'H', long)]
     pub host: Option<String>,
-    #[arg(long)]
+    /// SSH port (default: 22)
+    #[arg(short = 'P', long)]
     pub port: Option<u16>,
-    #[arg(long)]
+    /// SSH username
+    #[arg(short = 'u', long)]
     pub username: Option<String>,
     #[arg(long)]
     pub password: Option<String>,
@@ -220,8 +230,8 @@ pub struct ExecCommand {
     #[arg(required = true, trailing_var_arg = true)]
     pub command: Vec<String>,
     /// Command execution timeout in milliseconds
-    #[arg(long)]
-    pub timeout: Option<u64>,
+    #[arg(long, default_value_t = DEFAULT_EXEC_TIMEOUT_MS)]
+    pub timeout: u64,
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
@@ -243,7 +253,7 @@ pub struct ConnectCommand {
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct SessionInputCommand {
-    #[arg(long)]
+    #[arg(short = 's', long)]
     pub session_id: String,
     #[arg(long)]
     pub input: String,
@@ -307,7 +317,7 @@ pub struct SpawnCommand {
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct ReadCommand {
-    #[arg(long)]
+    #[arg(short = 's', long)]
     pub session_id: String,
     #[arg(long)]
     pub offset: Option<usize>,
@@ -321,13 +331,13 @@ pub struct ReadCommand {
     pub raw: bool,
     #[arg(long, conflicts_with = "raw")]
     pub strip_ansi: bool,
-    #[arg(long)]
-    pub timeout: Option<u64>,
+    #[arg(long, default_value_t = DEFAULT_EXEC_TIMEOUT_MS)]
+    pub timeout: u64,
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct ResizeCommand {
-    #[arg(long)]
+    #[arg(short = 's', long)]
     pub session_id: String,
     #[arg(long)]
     pub cols: u32,
@@ -337,7 +347,7 @@ pub struct ResizeCommand {
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct SignalCommand {
-    #[arg(long)]
+    #[arg(short = 's', long)]
     pub session_id: String,
     #[arg(long)]
     pub signal: String,
@@ -345,19 +355,22 @@ pub struct SignalCommand {
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct StatusCommand {
-    #[arg(long)]
+    #[arg(short = 's', long)]
     pub session_id: String,
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct SessionExecCommand {
-    #[arg(long)]
+    #[arg(short = 's', long)]
     pub session_id: String,
     #[arg(required = true, trailing_var_arg = true)]
     pub command: Vec<String>,
     /// Command execution timeout in milliseconds
-    #[arg(long)]
-    pub timeout: Option<u64>,
+    #[arg(long, default_value_t = DEFAULT_EXEC_TIMEOUT_MS)]
+    pub timeout: u64,
+    /// Fire the command and return immediately without waiting for output
+    #[arg(long, default_value_t = false)]
+    pub detach: bool,
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
@@ -452,6 +465,9 @@ pub struct ProxyCreateCommand {
     /// Local SOCKS5 listener address in host:port format
     #[arg(long, conflicts_with = "local")]
     pub socks5: Option<String>,
+    /// Human-readable proxy name (default: auto-generated like "p1", "p2")
+    #[arg(long)]
+    pub name: Option<String>,
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
@@ -471,7 +487,7 @@ pub struct ProxyPingCommand {
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let json = cli.effective_json();
-    match cli.command {
+    let result: Result<()> = match cli.command {
         Command::Exec(command) => ssh_backend::run_exec(command, json),
         Command::Shell(connect) => ssh_backend::run_shell(connect, json),
         Command::Connect(command) => kernel::run_client(WireRequest::Connect(command), json),
@@ -556,8 +572,39 @@ pub fn run() -> Result<()> {
         Command::Daemon(group) => match group.command {
             DaemonCommand::Serve => kernel::run_server(),
             DaemonCommand::Shutdown => kernel::run_client(WireRequest::Shutdown, json),
+            DaemonCommand::Status => {
+                let socket = crate::util::runtime_socket_path();
+                if std::os::unix::net::UnixStream::connect(&socket).is_err() {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&serde_json::json!({"running": false, "message": "Daemon is not running"}))?);
+                    } else {
+                        println!("Daemon is not running");
+                    }
+                    return Ok(());
+                }
+                kernel::run_client(WireRequest::DaemonStatus, json)
+            }
+            DaemonCommand::Install => kernel::daemon_install(),
+            DaemonCommand::Uninstall => kernel::daemon_uninstall(),
         },
+    };
+
+    // When --json is active, ALL output must be JSON — including errors.
+    // Without this, errors go to stderr as plain text and AI agents see blank stdout.
+    if let Err(e) = result {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "ok": false,
+                    "error": format!("{e:#}")
+                }))?
+            );
+            std::process::exit(1);
+        }
+        return Err(e);
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -598,7 +645,7 @@ mod tests {
             Command::Session(group) => match group.command {
                 SessionCommand::Read(command) => {
                     assert!(command.follow);
-                    assert_eq!(command.timeout, Some(1500));
+                    assert_eq!(command.timeout, 1500);
                     assert!(!command.raw);
                     assert!(command.strip_ansi);
                 }

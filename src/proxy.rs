@@ -70,8 +70,19 @@ pub fn daemon_proxy_create(command: ProxyCreateCommand, state: &mut ServerState)
         },
     );
 
-    state.next_id += 1;
-    let proxy_id = format!("p{}", state.next_id);
+    // Validate and resolve proxy name
+    if let Some(ref name) = command.name {
+        if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '-') {
+            bail!("proxy name must contain only alphanumeric characters and dashes");
+        }
+        if state.proxies.contains_key(name) {
+            bail!("proxy name '{name}' is already in use. Use 'agentssh proxy list' to see active proxies.");
+        }
+    }
+    let proxy_id = command.name.clone().unwrap_or_else(|| {
+        state.next_id += 1;
+        format!("p{}", state.next_id)
+    });
     let shutdown = Arc::new(AtomicBool::new(false));
     let thread_shutdown = shutdown.clone();
     let thread_mode = mode.clone();
@@ -94,7 +105,8 @@ pub fn daemon_proxy_create(command: ProxyCreateCommand, state: &mut ServerState)
         "proxy_id": proxy_id,
         "connection_id": connection_id,
         "local_addr": local_addr,
-        "mode": proxy_mode_name(&mode),
+        "remote_addr": proxy_remote_addr(&mode),
+        "proxy_type": proxy_mode_name(&mode),
         "status": proxy_status_name(&ProxyStatus::Running),
     });
 
@@ -458,7 +470,8 @@ fn proxy_summary(proxy: &ProxyState) -> Value {
         "proxy_id": proxy.id,
         "connection_id": proxy.connection_id,
         "local_addr": proxy.local_addr,
-        "mode": proxy_mode_name(&proxy.mode),
+        "remote_addr": proxy_remote_addr(&proxy.mode),
+        "proxy_type": proxy_mode_name(&proxy.mode),
         "status": if proxy_alive(proxy) { "running" } else { proxy_status_name(&proxy.status) },
     })
 }
@@ -489,8 +502,17 @@ fn refresh_proxy_status(proxy: &mut ProxyState) {
 
 fn proxy_mode_name(mode: &ProxyMode) -> &'static str {
     match mode {
-        ProxyMode::LocalForward { .. } => "local",
+        ProxyMode::LocalForward { .. } => "forward",
         ProxyMode::Socks5 => "socks5",
+    }
+}
+
+fn proxy_remote_addr(mode: &ProxyMode) -> Option<String> {
+    match mode {
+        ProxyMode::LocalForward { remote_host, remote_port } => {
+            Some(format!("{remote_host}:{remote_port}"))
+        }
+        ProxyMode::Socks5 => None,
     }
 }
 
@@ -519,6 +541,7 @@ mod tests {
             local: Some("127.0.0.1:9999".to_string()),
             remote: None,
             socks5: None,
+            name: None,
         })
         .expect_err("missing remote should fail");
 
@@ -539,6 +562,7 @@ mod tests {
 
         let summary = proxy_summary(&proxy);
         assert_eq!(summary["proxy_id"], "p1");
-        assert_eq!(summary["mode"], "socks5");
+        assert_eq!(summary["proxy_type"], "socks5");
+        assert_eq!(summary["remote_addr"], serde_json::Value::Null);
     }
 }

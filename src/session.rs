@@ -319,6 +319,22 @@ pub fn daemon_spawn(command: SpawnCommand, state: &mut ServerState) -> Result<Va
 }
 
 pub fn daemon_exec(command: SessionExecCommand, state: &mut ServerState) -> Result<Value> {
+    let command_line = command.command.join(" ");
+
+    // Detach mode: write command to the PTY, drain output, return immediately
+    if command.detach {
+        let session = get_session_mut(state, &command.session_id)?;
+        ensure_session_connected(session)?;
+        session.shell.write_all(format!("{}\n", command_line).as_bytes())?;
+        refresh_session_state(session);
+        return Ok(serde_json::json!({
+            "session_id": command.session_id,
+            "command": command_line,
+            "detached": true,
+            "status": "dispatched"
+        }));
+    }
+
     // Get the session's stored ConnectArgs to open a dedicated connection.
     // The session's SSH transport has an active PTY channel (from `connect`)
     // that conflicts with opening new channels via libssh2. A fresh connection
@@ -331,7 +347,6 @@ pub fn daemon_exec(command: SessionExecCommand, state: &mut ServerState) -> Resu
     };
 
     let (ssh, _host, _port, _username) = connect_with_info(connect_args)?;
-    let command_line = command.command.join(" ");
     let mut channel = ssh.channel_session()?;
     let (stdout, stderr, exit_status) =
         exec_channel(&ssh, &mut channel, &command_line, command.timeout)?;

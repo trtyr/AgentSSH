@@ -30,6 +30,7 @@ pub struct ServerState {
     pub proxies: BTreeMap<String, ProxyState>,
     pub next_id: u64,
     pub next_connection_id: u64,
+    pub started_at: u128,
 }
 
 pub fn run_server() -> Result<()> {
@@ -43,6 +44,10 @@ pub fn run_server() -> Result<()> {
     let listener = UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
     let _ = log_daemon(&format!("daemon started, socket at {}", socket.display()));
     let state = Arc::new(Mutex::new(ServerState::default()));
+    {
+        let mut guard = state.lock().map_err(|_| anyhow::anyhow!("daemon state lock poisoned"))?;
+        guard.started_at = now_ms();
+    }
     spawn_heartbeat(state.clone());
     for stream in listener.incoming() {
         match stream {
@@ -64,6 +69,13 @@ pub fn run_server() -> Result<()> {
 
 pub fn run_client(request: WireRequest, json: bool) -> Result<()> {
     let response = daemon_request(request)?;
+    if let Some(ref data) = response.data {
+        if let Some(status) = data.get("status").and_then(|v| v.as_str()) {
+            if status == "disconnected" && !json {
+                eprintln!("[hint] Session is disconnected. Use --reconnect when connecting to auto-recover.");
+            }
+        }
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&response)?);
         return Ok(());
@@ -96,10 +108,8 @@ pub fn run_read_command(command: ReadCommand, json: bool) -> Result<()> {
             return Ok(());
         }
 
-        if let Some(timeout_ms) = command.timeout {
-            if now_ms().saturating_sub(started_at) >= u128::from(timeout_ms) {
-                return Ok(());
-            }
+        if now_ms().saturating_sub(started_at) >= u128::from(command.timeout) {
+            return Ok(());
         }
 
         sleep_ms(FOLLOW_POLL_MS);
@@ -200,6 +210,30 @@ fn handle_request(request: WireRequest, state: &mut ServerState) -> Result<Value
         WireRequest::ProxyList => daemon_proxy_list(state),
         WireRequest::ProxyClose(command) => daemon_proxy_close(command, state),
         WireRequest::ProxyPing(command) => daemon_proxy_ping(command, state),
+        WireRequest::DaemonStatus => {
+            let all_sessions = state
+                .sessions
+                .values()
+                .map(|session| crate::ssh_backend::SessionMetadataForTesting {
+                    id: session.id.clone(),
+                    connection_id: session.connection_id.clone(),
+                })
+                .collect::<Vec<_>>();
+            Ok(serde_json::json!({
+                "running": true,
+                "pid": std::process::id(),
+                "socket": runtime_socket_path().display().to_string(),
+                "uptime_ms": now_ms().saturating_sub(state.started_at),
+                "connections": state.connections.len(),
+                "sessions": state.sessions.len(),
+                "proxies": state.proxies.len(),
+                "session_list": state
+                    .sessions
+                    .values()
+                    .map(|session| session_summary(session, &all_sessions))
+                    .collect::<Vec<_>>()
+            }))
+        }
         WireRequest::Shutdown => unreachable!(),
     }
 }
@@ -209,18 +243,21 @@ fn daemon_request(request: WireRequest) -> Result<WireResponse> {
     let socket = runtime_socket_path();
     let mut stream = UnixStream::connect(&socket)
         .with_context(|| format!("connect daemon {}", socket.display()))?;
+    stream.set_read_timeout(Some(Duration::from_secs(60)))
+        .context("set daemon socket timeout")?;
     stream.write_all(serde_json::to_string(&request)?.as_bytes())?;
     stream.write_all(b"\n")?;
     let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)?;
+    match BufReader::new(stream).read_line(&mut line) {
+        Ok(_) => {},
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock => {
+            bail!("Daemon request timed out after 60s. The daemon may be unresponsive. Try 'agentssh daemon shutdown' to restart.");
+        },
+        Err(e) => return Err(e).context("read daemon response"),
+    }
     let response: WireResponse = serde_json::from_str(line.trim()).context("parse daemon response")?;
     if !response.ok {
-        bail!(
-            "{}",
-            response
-                .error
-                .unwrap_or_else(|| "daemon request failed".to_string())
-        );
+        bail!("{}", response.error.unwrap_or_else(|| "daemon request failed".to_string()));
     }
     Ok(response)
 }
@@ -360,6 +397,98 @@ fn print_human(data: Value) -> Result<()> {
     Ok(())
 }
 
+pub fn daemon_install() -> Result<()> {
+    if !cfg!(target_os = "linux") {
+        bail!("systemd service installation is only supported on Linux");
+    }
+
+    let exe = std::env::current_exe().context("get current executable path")?;
+    let exe_str = exe.to_string_lossy();
+
+    let unit = format!(
+        "[Unit]\n\
+         Description=AgentSSH daemon for AI agent SSH workflows\n\
+         After=network.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={exe} daemon serve\n\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n",
+        exe = exe_str
+    );
+
+    let systemd_dir = dirs::home_dir()
+        .context("cannot find home directory")?
+        .join(".config")
+        .join("systemd")
+        .join("user");
+
+    fs::create_dir_all(&systemd_dir)
+        .context("create systemd user directory")?;
+
+    let unit_path = systemd_dir.join("agentssh.service");
+    fs::write(&unit_path, &unit)
+        .context("write service unit file")?;
+
+    println!("Installed systemd user service to {}", unit_path.display());
+
+    let status = ProcessCommand::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status()
+        .context("run systemctl daemon-reload")?;
+    if !status.success() {
+        bail!("systemctl --user daemon-reload failed");
+    }
+
+    let status = ProcessCommand::new("systemctl")
+        .args(["--user", "enable", "--now", "agentssh.service"])
+        .status()
+        .context("run systemctl enable --now")?;
+    if !status.success() {
+        bail!("systemctl --user enable --now agentssh.service failed");
+    }
+
+    println!("agentssh daemon service enabled and started.");
+    println!("Use 'systemctl --user status agentssh' to check status.");
+    Ok(())
+}
+
+pub fn daemon_uninstall() -> Result<()> {
+    if !cfg!(target_os = "linux") {
+        bail!("systemd service management is only supported on Linux");
+    }
+
+    let _ = ProcessCommand::new("systemctl")
+        .args(["--user", "stop", "agentssh.service"])
+        .status();
+
+    let _ = ProcessCommand::new("systemctl")
+        .args(["--user", "disable", "agentssh.service"])
+        .status();
+
+    let unit_path = dirs::home_dir()
+        .context("cannot find home directory")?
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join("agentssh.service");
+
+    if unit_path.exists() {
+        fs::remove_file(&unit_path).context("remove service unit file")?;
+    }
+
+    let _ = ProcessCommand::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status();
+
+    println!("agentssh daemon service uninstalled.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,7 +503,7 @@ mod tests {
             follow: true,
             raw: false,
             strip_ansi: false,
-            timeout: Some(1),
+            timeout: 1,
         };
 
         let error = run_read_command(command, false).expect_err("follow without json should fail");

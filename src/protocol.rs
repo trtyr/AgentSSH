@@ -39,6 +39,7 @@ pub enum WireRequest {
     ProxyList,
     ProxyClose(ProxyCloseCommand),
     ProxyPing(ProxyPingCommand),
+    DaemonStatus,
     Shutdown,
 }
 
