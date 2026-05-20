@@ -42,7 +42,7 @@ Three tiers of operations:
 | Tier | What | Persistent? | Use for... |
 |------|------|-------------|------------|
 | **One-shot** | `exec`, `file ls/upload/download/read/write/edit/delete` | No | Quick commands, file ops |
-| **Session** | `connect`, `session send/read/exec/spawn` | Yes | Interactive shells, stateful work |
+| **Session** | `connect`, `session send/read/exec/spawn/resize/signal/status` | Yes | Interactive shells, stateful work |
 | **Proxy** | `proxy create` | Yes | Tunnels, SOCKS5 |
 
 ## First time: save a profile
@@ -79,6 +79,36 @@ export AGENTSSH_DEFAULT_PROFILE=prod
 agentssh --json exec -- uptime  # --profile inferred from env var
 ```
 Inline `--profile` still overrides the default.
+
+View a profile's details:
+
+```bash
+agentssh profile read prod    # show profile details
+```
+
+### Auth options
+
+All commands that connect (`exec`, `shell`, `connect`, `file`, `proxy`) support
+these authentication flags:
+
+```bash
+# SSH key passphrase
+agentssh exec --profile prod --passphrase "key-password" -- whoami
+
+# Read credentials from environment variables (CI-friendly)
+agentssh exec --host example.com --username root \
+  --private-key-env SSH_KEY -- whoami
+
+agentssh exec --host example.com --username root \
+  --password-env SSH_PASSWORD -- whoami
+
+agentssh exec --host example.com --username root \
+  --private-key-env SSH_KEY --passphrase-env KEY_PASSPHRASE -- whoami
+```
+
+Flags: `--password`, `--password-env`, `--private-key-path`, `--private-key-env`,
+`--passphrase`, `--passphrase-env`, `--ready-timeout-ms` (SSH handshake timeout
+in milliseconds).
 
 ## Output modes
 
@@ -191,6 +221,29 @@ agentssh file delete --profile prod --remote /tmp/build --recursive
 
 `file read` without `--json` prints the file content directly — no JSON wrapping, no \n escaping.
 
+**All file commands accept `--session-id`** to reuse an existing SSH connection
+instead of opening a new one:
+
+```bash
+# Upload using an existing session's connection
+agentssh file upload --session-id s1 --local ./app.tar.gz --remote /tmp/app.tar.gz
+
+# List directory via session
+agentssh --json file ls --session-id s1 --remote /var/www
+
+# Write a file via session
+agentssh file write --session-id s1 --remote /etc/config.ini --content "[app]\nport=8080\n"
+
+# Read a file via session
+agentssh file read --session-id s1 --remote /etc/config.ini
+
+# Delete a file via session
+agentssh file delete --session-id s1 --remote /tmp/old.log
+
+# Edit a file via session
+agentssh file edit --session-id s1 --remote /etc/config.ini --find "port=8080" --replace "port=9090"
+```
+
 ### Tier 2: Long-lived sessions (daemon-backed)
 
 Sessions keep an SSH connection alive. You can send multiple commands into the
@@ -208,6 +261,10 @@ agentssh connect --profile <name> --reconnect
 
 The daemon auto-starts if not running. Use `--reconnect` to survive network
 glitches — the daemon reconnects automatically.
+
+Additional flags: `--cols <n>` / `--rows <n>` (PTY dimensions, default 120×40),
+`--wait-ms <n>` (initial output wait, default 250ms), `--limit <n>` (initial
+output buffer, default 8000 bytes).
 
 **Run a clean command (no PTY noise):**
 
@@ -248,12 +305,34 @@ agentssh session send --session-id s1 \
   --respond "thepassword\n"
 ```
 
+Additional flags:
+
+- `--crlf` — converts LF to CRLF in input (useful for Windows targets)
+- `--wait-for-exit` — block until the shell exits or timeout
+- `--timeout <ms>` — deadline for wait-for-exit
+- `--strip-ansi` — explicitly strip ANSI codes (conflicts with `--raw`)
+
+```bash
+# Wait for a command to finish
+agentssh --json session send --session-id s1 \
+  --input "apt update\n" --wait-for-exit --timeout 60000
+
+# Windows target with CRLF
+agentssh session send --session-id s1 --crlf --input "dir\n"
+```
+
 **Read session output:**
 
 ```bash
 agentssh --json session read --session-id s1           # latest output
 agentssh --json session read --session-id s1 --follow  # stream until exit
 ```
+
+Additional flags:
+
+- `--offset <bytes>` — cursor-based pagination offset
+- `--strip-ansi` — explicitly strip ANSI codes (conflicts with `--raw`)
+- `--timeout <ms>` — timeout for `--follow` mode (default 30000ms)
 
 Output is cleaned by default: ANSI codes, Nerd Font icons, and control
 characters are stripped. Pass `--raw` to get raw PTY bytes.
@@ -265,12 +344,46 @@ agentssh session spawn --from s1
 # → session_id: s2 (shares SSH connection with s1, separate shell)
 ```
 
+Additional flags: `--cols <n>` / `--rows <n>` (PTY dimensions, default 120×40),
+`--wait-ms <n>` (initial output wait, default 250ms), `--limit <n>` (initial
+output buffer, default 8000 bytes).
+
 **Check health:**
 
 ```bash
 agentssh --json session ping --session-id s1
 # → {"alive": true, "status": "running"}
 ```
+
+**Resize PTY dimensions:**
+
+```bash
+agentssh --json session resize --session-id s1 --cols 200 --rows 50
+# → {"session_id": "s1", "cols": 200, "rows": 50}
+```
+
+Useful for full-screen apps or when you need wider output from commands.
+
+**Send a signal to the session's PTY:**
+
+```bash
+agentssh --json session signal --session-id s1 --signal INT
+# → {"session_id": "s1", "signal": "INT"}
+```
+
+Supported signals: `INT` (Ctrl-C), `QUIT` (Ctrl-\), `TSTP` (Ctrl-Z),
+`TERM`/`KILL` (closes the channel). Use `INT` to interrupt a running command,
+`KILL` to force-close the session.
+
+**Get detailed session metadata:**
+
+```bash
+agentssh --json session status --session-id s1
+```
+
+Returns: `id`, `connection_id`, `shared_with`, `host`, `port`, `username`,
+`status`, `output_bytes`, `cursor`, `created_at`, `updated_at`, `cols`, `rows`.
+`shared_with` lists other sessions sharing the same SSH connection.
 
 **List all sessions:**
 
@@ -342,7 +455,12 @@ The daemon auto-starts when you run `connect`, `session`, or `proxy` commands.
 Only shut it down when you're completely done.
 
 `daemon status` returns JSON when `--json` is passed:
-`{"running": true, "pid": 12345, "uptime_seconds": 3600, "sessions": 2, "proxies": 1}`.
+```json
+{"running": true, "pid": 12345, "socket": "/tmp/agentssh-user.sock", "uptime_ms": 3600000, "connections": 1, "sessions": 2, "proxies": 1, "session_list": [...]}
+```
+Fields: `running`, `pid`, `socket` (daemon socket path), `uptime_ms`
+(milliseconds, NOT seconds), `connections` (pooled SSH connections), `sessions`
+(count), `proxies` (count), `session_list` (array of session summaries).
 
 ## Common workflows
 
@@ -494,12 +612,28 @@ By default, session output has:
 
 Use `--raw` on `session send` or `session read` to get unmodified PTY output.
 
+## Session metadata
+
+Sessions return metadata with these fields, available from `connect`, `spawn`,
+`session list`, and `session status`:
+
+- `id` — session identifier (e.g. "s1")
+- `connection_id` — pooled SSH connection this session uses
+- `shared_with` — other sessions sharing the same SSH connection
+- `host`, `port`, `username` — connection details
+- `status` — "running", "disconnected", or "closed"
+- `output_bytes` — buffered output size
+- `cursor` — read cursor position
+- `cols`, `rows` — PTY dimensions
+- `created_at`, `updated_at` — timestamps (milliseconds since epoch)
+
 ## Quick reference card
 
 ```bash
 # Profiles
 agentssh profile add <name> --host <h> --username <u>
 agentssh profile list
+agentssh profile read <name>
 agentssh profile delete <name>
 # Set default profile to avoid repeating --profile
 export AGENTSSH_DEFAULT_PROFILE=my-server
@@ -508,6 +642,12 @@ agentssh -p prod --json exec -- uptime
 # Explicit output format control
 agentssh --json exec --profile prod -- <cmd>
 agentssh --output text exec --profile prod -- <cmd>
+
+# Auth options (available on all connect commands)
+agentssh exec --private-key-env KEY_VAR -- <cmd>
+agentssh exec --password-env PASS_VAR -- <cmd>
+agentssh exec --passphrase "key-password" -- <cmd>
+agentssh exec --ready-timeout-ms 10000 -- <cmd>
 
 # One-shot (default 30s timeout)
 agentssh --json exec -p <profile> -- <cmd>
@@ -521,14 +661,26 @@ agentssh file read -p <profile> --remote <r>
 agentssh file edit -p <profile> --remote <r> --find <f> --replace <r> [--regex]
 agentssh file delete -p <profile> --remote <r> [--recursive]
 
+# File ops via session (reuse existing connection)
+agentssh file upload -s <id> --local <l> --remote <r>
+agentssh file download -s <id> --remote <r> --local <l>
+agentssh --json file ls -s <id> --remote <path>
+agentssh file write -s <id> --remote <r> --content <c> [--append]
+agentssh file read -s <id> --remote <r>
+agentssh file edit -s <id> --remote <r> --find <f> --replace <r> [--regex]
+agentssh file delete -s <id> --remote <r> [--recursive]
+
 # Sessions
-agentssh connect -p <profile> --reconnect
+agentssh connect -p <profile> [--reconnect] [--cols 200] [--rows 50]
 agentssh --json session exec -s <id> -- <cmd>
 agentssh --json session exec -s <id> --timeout 60000 -- <cmd>
 agentssh --json session exec -s <id> --detach -- "background_job &"
-agentssh session send -s <id> --input "<text>"
-agentssh --json session read -s <id> [--follow]
+agentssh session send -s <id> --input "<text>" [--crlf] [--wait-for-exit] [--timeout 60000]
+agentssh --json session read -s <id> [--follow] [--offset 1000] [--strip-ansi] [--timeout 60000]
 agentssh session spawn --from <id>
+agentssh --json session resize -s <id> --cols 200 --rows 50
+agentssh --json session signal -s <id> --signal INT
+agentssh --json session status -s <id>
 agentssh --json session list
 agentssh --json session ping -s <id>
 agentssh session close -s <id>
