@@ -63,10 +63,15 @@ pub fn connect_with_info(mut args: ConnectArgs) -> Result<(Session, String, u16,
     let retries = args.retry.unwrap_or(0);
     let retry_delay_ms = args.retry_delay_ms.unwrap_or(0);
 
+    let connect_timeout = std::time::Duration::from_millis(ready_timeout_ms);
+
     for attempt in 0..=retries {
-        let stream = match TcpStream::connect((host.as_str(), port)).with_context(|| {
+        let addr: std::net::SocketAddr = format!("{host}:{port}")
+            .parse()
+            .with_context(|| format!("invalid address {host}:{port}"))?;
+        let stream = match TcpStream::connect_timeout(&addr, connect_timeout).with_context(|| {
             format!(
-                "failed to connect to {host}:{port}. Check that the host is reachable and the port is correct."
+                "failed to connect to {host}:{port} (timeout: {ready_timeout_ms}ms). Check that the host is reachable and the port is correct."
             )
         }) {
             Ok(stream) => stream,
