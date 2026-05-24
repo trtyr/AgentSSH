@@ -106,7 +106,9 @@ pub fn ensure_session_connected(session: &RemoteSession) -> Result<()> {
     bail!("session '{}' is {}", session.id, session.status)
 }
 
-pub fn refresh_session_state(session: &mut RemoteSession) {
+/// Drain all currently available PTY output into the session buffer.
+/// Single non-blocking sweep — no retry loop.
+fn drain_output_now(session: &mut RemoteSession) {
     let mut buf = [0_u8; 8192];
     let mut saw_error = false;
     loop {
@@ -122,9 +124,7 @@ pub fn refresh_session_state(session: &mut RemoteSession) {
                 session.updated_at = now_ms();
             }
             Err(error) => {
-                if error.kind() != std::io::ErrorKind::WouldBlock
-                    && error.kind() != std::io::ErrorKind::TimedOut
-                {
+                if error.kind() != std::io::ErrorKind::WouldBlock {
                     saw_error = true;
                 }
                 break;
@@ -145,9 +145,7 @@ pub fn refresh_session_state(session: &mut RemoteSession) {
                 session.updated_at = now_ms();
             }
             Err(error) => {
-                if error.kind() != std::io::ErrorKind::WouldBlock
-                    && error.kind() != std::io::ErrorKind::TimedOut
-                {
+                if error.kind() != std::io::ErrorKind::WouldBlock {
                     saw_error = true;
                 }
                 break;
@@ -169,6 +167,47 @@ pub fn refresh_session_state(session: &mut RemoteSession) {
     } else if saw_error {
         session.status = "disconnected".to_string();
     }
+}
+
+/// Poll the PTY channel for output using non-blocking reads with retry.
+/// Uses the same proven pattern as `exec_channel`: WouldBlock → sleep → retry.
+/// Keeps polling until `poll_ms` has elapsed with no new data, or total
+/// `timeout_ms` is exceeded, or the session closes.
+pub fn refresh_session_state_poll(session: &mut RemoteSession, poll_ms: u64, timeout_ms: u64) {
+    let deadline = now_ms().saturating_add(u128::from(timeout_ms));
+    let mut idle_since = now_ms();
+
+    loop {
+        let before = session.output.len();
+
+        // Non-blocking drain sweep
+        drain_output_now(session);
+
+        // If we got new data, reset idle timer and immediately try again
+        if session.output.len() > before {
+            idle_since = now_ms();
+            continue;
+        }
+
+        // Check exit conditions
+        if now_ms().saturating_sub(idle_since) >= u128::from(poll_ms) {
+            break; // No new data for poll_ms
+        }
+        if now_ms() >= deadline {
+            break; // Total timeout exceeded
+        }
+        if matches!(session.status.as_str(), "closed" | "disconnected") {
+            break;
+        }
+
+        sleep_ms(50);
+    }
+}
+
+/// Legacy single-sweep refresh — used by heartbeat and lightweight checks
+/// where polling is not appropriate.
+pub fn refresh_session_state(session: &mut RemoteSession) {
+    drain_output_now(session);
 }
 
 pub fn page_output(
@@ -218,22 +257,6 @@ pub fn get_session_mut<'a>(
         .sessions
         .get_mut(session_id)
         .ok_or_else(|| anyhow!("session '{}' not found. Use 'agentssh session list' to see active sessions.", session_id))
-}
-
-/// Temporarily set the SSH connection to blocking mode for reliable I/O.
-/// Returns the connection_id so the caller can restore non-blocking mode later.
-fn begin_blocking_io(state: &mut ServerState, connection_id: &str, timeout_ms: u32) {
-    if let Some(conn) = state.connections.get_mut(connection_id) {
-        conn.ssh.set_timeout(timeout_ms);
-        conn.ssh.set_blocking(true);
-    }
-}
-
-/// Restore the SSH connection to non-blocking mode after blocking I/O.
-fn end_blocking_io(state: &mut ServerState, connection_id: &str) {
-    if let Some(conn) = state.connections.get_mut(connection_id) {
-        conn.ssh.set_blocking(false);
-    }
 }
 
 pub fn normalize_input(input: &str, crlf: bool) -> String {
@@ -384,44 +407,24 @@ pub fn daemon_exec(command: SessionExecCommand, state: &mut ServerState) -> Resu
 pub fn daemon_send(command: SessionInputCommand, state: &mut ServerState) -> Result<Value> {
     let expect_pairs = command.expect_pairs()?;
 
-    // Get connection_id from session (separate borrow scope)
-    let connection_id = {
-        let session = get_session_mut(state, &command.session_id)?;
-        ensure_session_connected(session)?;
-        session.connection_id.clone()
-    };
-
-    // Switch to blocking mode for reliable PTY I/O (timeout = wait_ms to prevent hangs)
-    let blocking_timeout = u32::try_from(command.wait_ms.max(2000)).unwrap_or(5000);
-    begin_blocking_io(state, &connection_id, blocking_timeout);
-
-    let result = daemon_send_inner(command, expect_pairs, state, &connection_id);
-
-    // Always restore non-blocking mode
-    end_blocking_io(state, &connection_id);
-
-    result
-}
-
-fn daemon_send_inner(
-    command: SessionInputCommand,
-    expect_pairs: Vec<crate::cli::ExpectRespondPair>,
-    state: &mut ServerState,
-    _connection_id: &str,
-) -> Result<Value> {
     let session = get_session_mut(state, &command.session_id)?;
+    ensure_session_connected(session)?;
 
     let input = normalize_input(&command.input, command.crlf);
     session.shell.write_all(input.as_bytes())?;
-    sleep_ms(command.wait_ms);
-    refresh_session_state(session);
 
+    // Poll for PTY output using non-blocking reads with retry (same pattern as exec_channel).
+    // wait_ms controls how long to wait for initial output; total timeout prevents hangs.
+    let poll_ms = command.wait_ms.max(500);
+    let total_timeout = command.timeout.unwrap_or(30_000);
+    refresh_session_state_poll(session, poll_ms, total_timeout);
+
+    // Handle expect/respond pairs
     let mut auto_responses = Vec::new();
     for pair in expect_pairs {
         if output_matches(session, &pair.expect)? {
             session.shell.write_all(pair.respond.as_bytes())?;
-            sleep_ms(command.wait_ms);
-            refresh_session_state(session);
+            refresh_session_state_poll(session, poll_ms, total_timeout);
             auto_responses.push(serde_json::json!({
                 "expect": pair.expect,
                 "responded": true,
@@ -442,8 +445,7 @@ fn daemon_send_inner(
             if now_ms() >= deadline {
                 break;
             }
-            sleep_ms(command.wait_ms);
-            refresh_session_state(session);
+            refresh_session_state_poll(session, 500, 2000);
         }
     }
 
@@ -459,8 +461,7 @@ fn daemon_send_inner(
                     break;
                 }
             }
-            sleep_ms(command.wait_ms);
-            refresh_session_state(session);
+            refresh_session_state_poll(session, 200, 2000);
             let current_len = session.output.len();
             if current_len != last_output_len {
                 last_output_len = current_len;
@@ -489,30 +490,20 @@ fn daemon_send_inner(
 }
 
 pub fn daemon_read(command: ReadCommand, state: &mut ServerState) -> Result<Value> {
-    // Get connection_id (separate borrow scope)
-    let connection_id = {
-        let session = get_session_mut(state, &command.session_id)?;
-        session.connection_id.clone()
-    };
-
-    // Switch to blocking mode for reliable PTY read
-    let blocking_timeout = u32::try_from(command.wait_ms.max(2000)).unwrap_or(5000);
-    begin_blocking_io(state, &connection_id, blocking_timeout);
-
     let session = get_session_mut(state, &command.session_id)?;
-    sleep_ms(command.wait_ms);
-    refresh_session_state(session);
+
+    // Poll for any new PTY output using non-blocking reads with retry
+    let poll_ms = command.wait_ms.max(500);
+    refresh_session_state_poll(session, poll_ms, command.timeout);
+
     let page = page_output(session, command.offset, command.limit, should_strip_ansi(command.raw));
-    let response = Ok(daemon_output_response(
+    Ok(daemon_output_response(
         &session.id,
         page,
         &session.status,
         session.exit_status,
         session.exit_signal.clone(),
-    ));
-
-    end_blocking_io(state, &connection_id);
-    response
+    ))
 }
 
 pub fn daemon_resize(command: ResizeCommand, state: &mut ServerState) -> Result<Value> {
