@@ -122,7 +122,9 @@ pub fn refresh_session_state(session: &mut RemoteSession) {
                 session.updated_at = now_ms();
             }
             Err(error) => {
-                if error.kind() != std::io::ErrorKind::WouldBlock {
+                if error.kind() != std::io::ErrorKind::WouldBlock
+                    && error.kind() != std::io::ErrorKind::TimedOut
+                {
                     saw_error = true;
                 }
                 break;
@@ -143,7 +145,9 @@ pub fn refresh_session_state(session: &mut RemoteSession) {
                 session.updated_at = now_ms();
             }
             Err(error) => {
-                if error.kind() != std::io::ErrorKind::WouldBlock {
+                if error.kind() != std::io::ErrorKind::WouldBlock
+                    && error.kind() != std::io::ErrorKind::TimedOut
+                {
                     saw_error = true;
                 }
                 break;
