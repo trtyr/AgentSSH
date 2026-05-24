@@ -169,19 +169,37 @@ fn drain_output_now(session: &mut RemoteSession) {
     }
 }
 
-/// Poll the PTY channel for output using non-blocking reads with retry.
-/// Uses the same proven pattern as `exec_channel`: WouldBlock → sleep → retry.
-/// Keeps polling until `poll_ms` has elapsed with no new data, or total
-/// `timeout_ms` is exceeded, or the session closes.
-pub fn refresh_session_state_poll(session: &mut RemoteSession, poll_ms: u64, timeout_ms: u64) {
+/// Poll the PTY channel for output using blocking-mode reads with timeout.
+///
+/// **Why blocking mode?** libssh2's `_libssh2_transport_read()` may have pending
+/// output (e.g., WINDOW_ADJUST) in its internal buffer. In non-blocking mode,
+/// `channel.read()` returns EAGAIN when it can't flush this output, and a
+/// read-only loop never triggers `_libssh2_transport_send()` to flush it —
+/// creating a transport deadlock. Blocking mode with timeout lets BLOCK_ADJUST
+/// use `select()`/`poll()` internally: it waits for socket writability, flushes
+/// pending output, then reads incoming data. Timeout expiry returns EAGAIN,
+/// which ssh2-rs converts to `WouldBlock` — already handled by `drain_output_now`.
+pub fn refresh_session_state_poll(
+    session: &mut RemoteSession,
+    ssh: &ssh2::Session,
+    poll_ms: u64,
+    timeout_ms: u64,
+) {
     let deadline = now_ms().saturating_add(u128::from(timeout_ms));
     let mut idle_since = now_ms();
 
     loop {
         let before = session.output.len();
 
-        // Non-blocking drain sweep
+        // Use blocking mode with per-read timeout so libssh2's BLOCK_ADJUST
+        // properly flushes pending transport output (WINDOW_ADJUST, key exchange
+        // responses, etc.) before reading. This prevents the transport deadlock
+        // where libssh2 has pending output but only reads are attempted.
+        ssh.set_blocking(true);
+        ssh.set_timeout(poll_ms.min(500) as u32);
         drain_output_now(session);
+        ssh.set_timeout(0);
+        ssh.set_blocking(false);
 
         // If we got new data, reset idle timer and immediately try again
         if session.output.len() > before {
@@ -257,6 +275,20 @@ pub fn get_session_mut<'a>(
         .sessions
         .get_mut(session_id)
         .ok_or_else(|| anyhow!("session '{}' not found. Use 'agentssh session list' to see active sessions.", session_id))
+}
+
+/// Extract the SSH Session for a given session's connection.
+/// Returns a cloned Session (cheap Arc clone) to avoid borrow conflicts.
+pub fn ssh_for_session(state: &ServerState, session_id: &str) -> Result<ssh2::Session> {
+    let session = state
+        .sessions
+        .get(session_id)
+        .ok_or_else(|| anyhow!("session '{}' not found", session_id))?;
+    state
+        .connections
+        .get(&session.connection_id)
+        .map(|c| c.ssh.clone())
+        .ok_or_else(|| anyhow!("connection '{}' not found", session.connection_id))
 }
 
 pub fn normalize_input(input: &str, crlf: bool) -> String {
@@ -407,24 +439,35 @@ pub fn daemon_exec(command: SessionExecCommand, state: &mut ServerState) -> Resu
 pub fn daemon_send(command: SessionInputCommand, state: &mut ServerState) -> Result<Value> {
     let expect_pairs = command.expect_pairs()?;
 
-    let session = get_session_mut(state, &command.session_id)?;
-    ensure_session_connected(session)?;
+    // Get SSH session before mutable session borrow (borrow checker: separate scopes)
+    let ssh = ssh_for_session(state, &command.session_id)?;
+    {
+        let session = get_session_mut(state, &command.session_id)?;
+        ensure_session_connected(session)?;
+    }
 
-    let input = normalize_input(&command.input, command.crlf);
-    session.shell.write_all(input.as_bytes())?;
-
-    // Poll for PTY output using non-blocking reads with retry (same pattern as exec_channel).
-    // wait_ms controls how long to wait for initial output; total timeout prevents hangs.
     let poll_ms = command.wait_ms.max(500);
     let total_timeout = command.timeout.unwrap_or(30_000);
-    refresh_session_state_poll(session, poll_ms, total_timeout);
+    let input = normalize_input(&command.input, command.crlf);
+
+    // Write input and poll for output
+    {
+        let session = get_session_mut(state, &command.session_id)?;
+        session.shell.write_all(input.as_bytes())?;
+        refresh_session_state_poll(session, &ssh, poll_ms, total_timeout);
+    }
 
     // Handle expect/respond pairs
     let mut auto_responses = Vec::new();
     for pair in expect_pairs {
-        if output_matches(session, &pair.expect)? {
+        let matched = {
+            let session = get_session_mut(state, &command.session_id)?;
+            output_matches(session, &pair.expect)?
+        };
+        if matched {
+            let session = get_session_mut(state, &command.session_id)?;
             session.shell.write_all(pair.respond.as_bytes())?;
-            refresh_session_state_poll(session, poll_ms, total_timeout);
+            refresh_session_state_poll(session, &ssh, poll_ms, total_timeout);
             auto_responses.push(serde_json::json!({
                 "expect": pair.expect,
                 "responded": true,
@@ -441,11 +484,12 @@ pub fn daemon_send(command: SessionInputCommand, state: &mut ServerState) -> Res
     if command.wait_for_exit {
         let timeout_ms = command.timeout.unwrap_or(DEFAULT_WAIT_FOR_EXIT_TIMEOUT_MS);
         let deadline = now_ms().saturating_add(u128::from(timeout_ms));
-        while !matches!(session.status.as_str(), "closed" | "disconnected") {
-            if now_ms() >= deadline {
+        loop {
+            let session = get_session_mut(state, &command.session_id)?;
+            if matches!(session.status.as_str(), "closed" | "disconnected") || now_ms() >= deadline {
                 break;
             }
-            refresh_session_state_poll(session, 500, 2000);
+            refresh_session_state_poll(session, &ssh, 500, 2000);
         }
     }
 
@@ -453,7 +497,10 @@ pub fn daemon_send(command: SessionInputCommand, state: &mut ServerState) -> Res
         let deadline = command
             .timeout
             .map(|timeout_ms| now_ms().saturating_add(u128::from(timeout_ms)));
-        let mut last_output_len = session.output.len();
+        let mut last_output_len = {
+            let session = get_session_mut(state, &command.session_id)?;
+            session.output.len()
+        };
         let mut idle_since = now_ms();
         loop {
             if let Some(deadline) = deadline {
@@ -461,20 +508,24 @@ pub fn daemon_send(command: SessionInputCommand, state: &mut ServerState) -> Res
                     break;
                 }
             }
-            refresh_session_state_poll(session, 200, 2000);
-            let current_len = session.output.len();
-            if current_len != last_output_len {
-                last_output_len = current_len;
-                idle_since = now_ms();
-            } else if now_ms().saturating_sub(idle_since) >= u128::from(idle_ms) {
-                break;
-            }
-            if matches!(session.status.as_str(), "closed" | "disconnected") {
-                break;
+            {
+                let session = get_session_mut(state, &command.session_id)?;
+                refresh_session_state_poll(session, &ssh, 200, 2000);
+                let current_len = session.output.len();
+                if current_len != last_output_len {
+                    last_output_len = current_len;
+                    idle_since = now_ms();
+                } else if now_ms().saturating_sub(idle_since) >= u128::from(idle_ms) {
+                    break;
+                }
+                if matches!(session.status.as_str(), "closed" | "disconnected") {
+                    break;
+                }
             }
         }
     }
 
+    let session = get_session_mut(state, &command.session_id)?;
     let page = page_output(session, None, command.limit, should_strip_ansi(command.raw));
     let mut response = daemon_output_response(
         &session.id,
@@ -490,11 +541,12 @@ pub fn daemon_send(command: SessionInputCommand, state: &mut ServerState) -> Res
 }
 
 pub fn daemon_read(command: ReadCommand, state: &mut ServerState) -> Result<Value> {
+    let ssh = ssh_for_session(state, &command.session_id)?;
     let session = get_session_mut(state, &command.session_id)?;
 
-    // Poll for any new PTY output using non-blocking reads with retry
+    // Poll for any new PTY output using blocking-mode reads
     let poll_ms = command.wait_ms.max(500);
-    refresh_session_state_poll(session, poll_ms, command.timeout);
+    refresh_session_state_poll(session, &ssh, poll_ms, command.timeout);
 
     let page = page_output(session, command.offset, command.limit, should_strip_ansi(command.raw));
     Ok(daemon_output_response(
