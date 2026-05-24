@@ -1,6 +1,6 @@
 ---
 name: agentssh
-version: 0.2.2
+version: 0.2.5
 description: |
   AI-agent SSH capability. Use when the agent needs to run commands on remote
   servers, transfer files, manage long-lived SSH sessions, or set up SSH
