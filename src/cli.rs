@@ -269,6 +269,10 @@ pub struct SessionInputCommand {
     pub strip_ansi: bool,
     #[arg(long, default_value_t = false)]
     pub wait_for_exit: bool,
+    /// Wait for output to settle (no new data for this many ms) before returning.
+    /// Useful for capturing full command output in one call instead of polling session read.
+    #[arg(long)]
+    pub wait_idle: Option<u64>,
     #[arg(long)]
     pub timeout: Option<u64>,
     #[arg(long)]
@@ -767,6 +771,7 @@ mod tests {
             raw: false,
             strip_ansi: false,
             wait_for_exit: false,
+            wait_idle: None,
             timeout: None,
             expect: Some("password".to_string()),
             respond: None,

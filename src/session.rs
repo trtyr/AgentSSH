@@ -402,6 +402,33 @@ pub fn daemon_send(command: SessionInputCommand, state: &mut ServerState) -> Res
         }
     }
 
+    if let Some(idle_ms) = command.wait_idle {
+        let deadline = command
+            .timeout
+            .map(|timeout_ms| now_ms().saturating_add(u128::from(timeout_ms)));
+        let mut last_output_len = session.output.len();
+        let mut idle_since = now_ms();
+        loop {
+            if let Some(deadline) = deadline {
+                if now_ms() >= deadline {
+                    break;
+                }
+            }
+            sleep_ms(command.wait_ms);
+            refresh_session_state(session);
+            let current_len = session.output.len();
+            if current_len != last_output_len {
+                last_output_len = current_len;
+                idle_since = now_ms();
+            } else if now_ms().saturating_sub(idle_since) >= u128::from(idle_ms) {
+                break;
+            }
+            if matches!(session.status.as_str(), "closed" | "disconnected") {
+                break;
+            }
+        }
+    }
+
     let page = page_output(session, None, command.limit, should_strip_ansi(command.raw));
     let mut response = daemon_output_response(
         &session.id,

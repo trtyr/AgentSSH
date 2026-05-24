@@ -1,6 +1,6 @@
 ---
 name: agentssh
-version: 0.2.0
+version: 0.2.2
 description: |
   AI-agent SSH capability. Use when the agent needs to run commands on remote
   servers, transfer files, manage long-lived SSH sessions, or set up SSH
@@ -309,13 +309,18 @@ Additional flags:
 
 - `--crlf` — converts LF to CRLF in input (useful for Windows targets)
 - `--wait-for-exit` — block until the shell exits or timeout
-- `--timeout <ms>` — deadline for wait-for-exit
+- `--wait-idle <ms>` — wait for output to settle (no new data for this many ms) before returning. Useful for capturing full command output in one call instead of polling `session read`.
+- `--timeout <ms>` — deadline for wait-for-exit or wait-idle
 - `--strip-ansi` — explicitly strip ANSI codes (conflicts with `--raw`)
 
 ```bash
 # Wait for a command to finish
 agentssh --json session send --session-id s1 \
   --input "apt update\n" --wait-for-exit --timeout 60000
+
+# Send command and wait for output to settle (recommended for agents)
+agentssh --json session send --session-id s1 \
+  --input "ls -la\n" --wait-idle 500
 
 # Windows target with CRLF
 agentssh session send --session-id s1 --crlf --input "dir\n"
@@ -675,7 +680,7 @@ agentssh connect -p <profile> [--reconnect] [--cols 200] [--rows 50]
 agentssh --json session exec -s <id> -- <cmd>
 agentssh --json session exec -s <id> --timeout 60000 -- <cmd>
 agentssh --json session exec -s <id> --detach -- "background_job &"
-agentssh session send -s <id> --input "<text>" [--crlf] [--wait-for-exit] [--timeout 60000]
+agentssh session send -s <id> --input "<text>" [--crlf] [--wait-for-exit] [--wait-idle 500] [--timeout 60000] [--crlf] [--wait-for-exit] [--timeout 60000]
 agentssh --json session read -s <id> [--follow] [--offset 1000] [--strip-ansi] [--timeout 60000]
 agentssh session spawn --from <id>
 agentssh --json session resize -s <id> --cols 200 --rows 50
