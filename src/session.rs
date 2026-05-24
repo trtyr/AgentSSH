@@ -8,6 +8,8 @@ use serde_json::Value;
 use ssh2::Channel;
 use std::io::{Read, Write};
 
+const DEFAULT_WAIT_FOR_EXIT_TIMEOUT_MS: u64 = 60_000;
+
 pub struct RemoteSession {
     pub id: String,
     pub connection_id: String,
@@ -214,6 +216,22 @@ pub fn get_session_mut<'a>(
         .ok_or_else(|| anyhow!("session '{}' not found. Use 'agentssh session list' to see active sessions.", session_id))
 }
 
+/// Temporarily set the SSH connection to blocking mode for reliable I/O.
+/// Returns the connection_id so the caller can restore non-blocking mode later.
+fn begin_blocking_io(state: &mut ServerState, connection_id: &str, timeout_ms: u32) {
+    if let Some(conn) = state.connections.get_mut(connection_id) {
+        conn.ssh.set_timeout(timeout_ms);
+        conn.ssh.set_blocking(true);
+    }
+}
+
+/// Restore the SSH connection to non-blocking mode after blocking I/O.
+fn end_blocking_io(state: &mut ServerState, connection_id: &str) {
+    if let Some(conn) = state.connections.get_mut(connection_id) {
+        conn.ssh.set_blocking(false);
+    }
+}
+
 pub fn normalize_input(input: &str, crlf: bool) -> String {
     if crlf {
         input.replace('\n', "\r\n")
@@ -361,8 +379,33 @@ pub fn daemon_exec(command: SessionExecCommand, state: &mut ServerState) -> Resu
 
 pub fn daemon_send(command: SessionInputCommand, state: &mut ServerState) -> Result<Value> {
     let expect_pairs = command.expect_pairs()?;
+
+    // Get connection_id from session (separate borrow scope)
+    let connection_id = {
+        let session = get_session_mut(state, &command.session_id)?;
+        ensure_session_connected(session)?;
+        session.connection_id.clone()
+    };
+
+    // Switch to blocking mode for reliable PTY I/O (timeout = wait_ms to prevent hangs)
+    let blocking_timeout = u32::try_from(command.wait_ms.max(2000)).unwrap_or(5000);
+    begin_blocking_io(state, &connection_id, blocking_timeout);
+
+    let result = daemon_send_inner(command, expect_pairs, state, &connection_id);
+
+    // Always restore non-blocking mode
+    end_blocking_io(state, &connection_id);
+
+    result
+}
+
+fn daemon_send_inner(
+    command: SessionInputCommand,
+    expect_pairs: Vec<crate::cli::ExpectRespondPair>,
+    state: &mut ServerState,
+    _connection_id: &str,
+) -> Result<Value> {
     let session = get_session_mut(state, &command.session_id)?;
-    ensure_session_connected(session)?;
 
     let input = normalize_input(&command.input, command.crlf);
     session.shell.write_all(input.as_bytes())?;
@@ -387,15 +430,13 @@ pub fn daemon_send(command: SessionInputCommand, state: &mut ServerState) -> Res
         }
     }
 
+    // wait-for-exit: mandatory 60s default timeout to prevent daemon deadlock
     if command.wait_for_exit {
-        let deadline = command
-            .timeout
-            .map(|timeout_ms| now_ms().saturating_add(u128::from(timeout_ms)));
+        let timeout_ms = command.timeout.unwrap_or(DEFAULT_WAIT_FOR_EXIT_TIMEOUT_MS);
+        let deadline = now_ms().saturating_add(u128::from(timeout_ms));
         while !matches!(session.status.as_str(), "closed" | "disconnected") {
-            if let Some(deadline) = deadline {
-                if now_ms() >= deadline {
-                    break;
-                }
+            if now_ms() >= deadline {
+                break;
             }
             sleep_ms(command.wait_ms);
             refresh_session_state(session);
@@ -444,17 +485,30 @@ pub fn daemon_send(command: SessionInputCommand, state: &mut ServerState) -> Res
 }
 
 pub fn daemon_read(command: ReadCommand, state: &mut ServerState) -> Result<Value> {
+    // Get connection_id (separate borrow scope)
+    let connection_id = {
+        let session = get_session_mut(state, &command.session_id)?;
+        session.connection_id.clone()
+    };
+
+    // Switch to blocking mode for reliable PTY read
+    let blocking_timeout = u32::try_from(command.wait_ms.max(2000)).unwrap_or(5000);
+    begin_blocking_io(state, &connection_id, blocking_timeout);
+
     let session = get_session_mut(state, &command.session_id)?;
     sleep_ms(command.wait_ms);
     refresh_session_state(session);
     let page = page_output(session, command.offset, command.limit, should_strip_ansi(command.raw));
-    Ok(daemon_output_response(
+    let response = Ok(daemon_output_response(
         &session.id,
         page,
         &session.status,
         session.exit_status,
         session.exit_signal.clone(),
-    ))
+    ));
+
+    end_blocking_io(state, &connection_id);
+    response
 }
 
 pub fn daemon_resize(command: ResizeCommand, state: &mut ServerState) -> Result<Value> {
