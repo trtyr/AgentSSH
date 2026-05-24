@@ -1,6 +1,6 @@
 [package]
 name = "agentssh"
-version = "0.2.6"
+version = "0.2.5"
 edition = "2024"
 description = "AI-native SSH toolkit — programmable JSON-speaking SSH/SFTP backend for AI agents"
 license = "MIT"
