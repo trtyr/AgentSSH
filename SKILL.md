@@ -1,6 +1,6 @@
 ---
 name: agentssh
-version: 0.2.5
+version: 0.2.8
 description: |
   AI-agent SSH capability. Use when the agent needs to run commands on remote
   servers, transfer files, manage long-lived SSH sessions, or set up SSH
@@ -26,7 +26,7 @@ cargo install agentssh          # latest from crates.io
 agentssh --version              # verify it works
 ```
 
-Prerequisites: `libssh2` (macOS: `brew install libssh2`, Linux: `libssh2-dev`).
+Prerequisites: Rust 1.85+ on Unix-like systems. No external `libssh2` system library is required.
 
 ## Mental model
 
@@ -73,12 +73,7 @@ agentssh exec --profile prod --host emergency.example.com -- uptime
 # inline --host wins over profile
 ```
 
-**Set a default profile** to skip `--profile` on every command:
-```bash
-export AGENTSSH_DEFAULT_PROFILE=prod
-agentssh --json exec -- uptime  # --profile inferred from env var
-```
-Inline `--profile` still overrides the default.
+There is no implicit default profile. Pass `--profile <name>` explicitly, or provide inline connection flags.
 
 View a profile's details:
 
@@ -186,8 +181,8 @@ agentssh file download --profile prod \
 agentssh --json file ls --profile prod --remote /var/www
 ```
 
-File transfer auto-negotiates protocol: SFTP → SCP → exec (base64 for
-Windows). Force a method with `--method sftp` or `--method scp`.
+File transfer auto-negotiates protocol: SFTP → exec (base64 for
+Windows). Force SFTP with `--method sftp`. The CLI still accepts `scp` for compatibility, but the current backend does not implement SCP.
 
 **Direct file operations (read/write/edit/delete):**
 
@@ -280,7 +275,7 @@ agentssh --json session exec --session-id s1 --timeout 60000 -- "dnf install ngi
 Use `session exec` for commands where you need structured output. No shell
 prompt garbage, no ANSI codes. Opens a dedicated SSH connection using the
 session's stored credentials — no PTY channel conflict. For maximum speed
-on repeated commands, use one-shot `exec` with `AGENTSSH_DEFAULT_PROFILE`.
+on repeated commands, use one-shot `exec` with an explicit `--profile`.
 
 **Fire-and-forget with --detach:**
 
@@ -640,8 +635,6 @@ agentssh profile add <name> --host <h> --username <u>
 agentssh profile list
 agentssh profile read <name>
 agentssh profile delete <name>
-# Set default profile to avoid repeating --profile
-export AGENTSSH_DEFAULT_PROFILE=my-server
 # Short flags: -p (profile), -H (host), -P (port), -u (username), -s (session-id)
 agentssh -p prod --json exec -- uptime
 # Explicit output format control
