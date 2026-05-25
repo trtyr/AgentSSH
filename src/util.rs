@@ -1,21 +1,16 @@
 use anyhow::{Result, anyhow};
 use clap::ValueEnum;
 use serde::Serialize;
-use serde_json::Value;
-use ssh2::FileStat;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_PORT: u16 = 22;
-pub const DEFAULT_READY_TIMEOUT_MS: u64 = 20_000;
 pub const DEFAULT_COLS: u32 = 120;
 pub const DEFAULT_ROWS: u32 = 40;
 pub const DEFAULT_LIMIT: usize = 8_000;
 pub const DEFAULT_WAIT_MS: u64 = 250;
-pub const MAX_BUFFER: usize = 1_000_000;
 pub const DEFAULT_EXEC_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -65,28 +60,11 @@ pub fn emit_message(json: bool, event: &str, message: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn sleep_ms(ms: u64) {
-    if ms > 0 {
-        thread::sleep(Duration::from_millis(ms));
-    }
-}
-
-pub fn now_ms() -> u128 {
+pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis()
-}
-
-pub fn stat_json(stat: FileStat) -> Value {
-    serde_json::json!({
-        "size": stat.size,
-        "uid": stat.uid,
-        "gid": stat.gid,
-        "perm": stat.perm,
-        "atime": stat.atime,
-        "mtime": stat.mtime,
-    })
+        .as_millis() as u64
 }
 
 /// Strip ANSI escape sequences, Private Use Area characters (Nerd Font icons),

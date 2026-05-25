@@ -1,512 +1,684 @@
-use crate::cli::ReadCommand;
+use crate::cli::*;
+use crate::connection;
 use crate::protocol::{WireRequest, WireResponse};
-use crate::ssh_backend::{
-    ProxyState, RemoteSession, SharedConnection, attempt_reconnect, daemon_connect,
-    daemon_file_delete, daemon_file_edit, daemon_file_read, daemon_download, daemon_exec,
-    daemon_ls, daemon_ping, daemon_proxy_close, daemon_proxy_create, daemon_proxy_list,
-    daemon_proxy_ping, daemon_read, daemon_resize, daemon_send, daemon_signal, daemon_spawn,
-    daemon_status, daemon_upload, daemon_write,
-    refresh_session_state, session_summary,
-};
-use crate::util::{log_daemon, now_ms, runtime_socket_path, sleep_ms};
+use crate::session::{self, SessionHandle};
+use crate::util::{self, now_ms};
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::os::unix::net::UnixStream as StdUnixStream;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use tokio::net::UnixListener;
+use tokio::sync::{Mutex, Notify};
 
-const HEARTBEAT_INTERVAL_MS: u64 = 60_000;
-const FOLLOW_POLL_MS: u64 = 100;
+// ---------------------------------------------------------------------------
+// SharedConnection (re-export from connection module)
+// ---------------------------------------------------------------------------
 
-#[derive(Default)]
+pub use crate::connection::SharedConnection;
+
+// ---------------------------------------------------------------------------
+// ServerState
+// ---------------------------------------------------------------------------
+
 pub struct ServerState {
-    pub sessions: BTreeMap<String, RemoteSession>,
+    pub sessions: BTreeMap<String, SessionHandle>,
     pub connections: BTreeMap<String, SharedConnection>,
-    pub proxies: BTreeMap<String, ProxyState>,
+    pub proxies: BTreeMap<String, crate::proxy::ProxyState>,
     pub next_id: u64,
     pub next_connection_id: u64,
-    pub started_at: u128,
+    pub started_at: u64,
 }
 
+impl ServerState {
+    fn new() -> Self {
+        Self {
+            sessions: BTreeMap::new(),
+            connections: BTreeMap::new(),
+            proxies: BTreeMap::new(),
+            next_id: 1,
+            next_connection_id: 1,
+            started_at: now_ms(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Daemon server
+// ---------------------------------------------------------------------------
+
+/// Start the daemon server. Runs until shutdown.
 pub fn run_server() -> Result<()> {
-    let socket = runtime_socket_path();
-    if socket.exists() {
-        let _ = fs::remove_file(&socket);
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async { run_server_async().await })
+}
+
+async fn run_server_async() -> Result<()> {
+    let socket_path = util::runtime_socket_path();
+    let socket_dir = Path::new(&socket_path)
+        .parent()
+        .context("socket path has no parent")?;
+    std::fs::create_dir_all(socket_dir)?;
+
+    // Remove stale socket
+    if Path::new(&socket_path).exists() {
+        std::fs::remove_file(&socket_path).ok();
     }
-    if let Some(parent) = socket.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let listener = UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
-    let _ = log_daemon(&format!("daemon started, socket at {}", socket.display()));
-    let state = Arc::new(Mutex::new(ServerState::default()));
-    {
-        let mut guard = state.lock().map_err(|_| anyhow::anyhow!("daemon state lock poisoned"))?;
-        guard.started_at = now_ms();
-    }
-    spawn_heartbeat(state.clone());
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                if handle_client(stream, &state)? {
-                    break;
+
+    let listener = UnixListener::bind(&socket_path)
+        .with_context(|| format!("binding socket at {}", socket_path.display()))?;
+
+    let state = Arc::new(Mutex::new(ServerState::new()));
+    let shutdown = Arc::new(Notify::new());
+
+    util::log_daemon(&format!("daemon listening on {}", socket_path.display()))?;
+
+    // Spawn heartbeat
+    let hb_state = state.clone();
+    let hb_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = hb_shutdown.notified() => break,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    let mut st = hb_state.lock().await;
+                    if let Err(e) = heartbeat(&mut st).await {
+                        let _ = util::log_daemon(&format!("heartbeat error: {}", e));
+                    }
                 }
             }
-            Err(error) => {
-                let _ = log_daemon(&format!("request error: accept error: {error}"));
-                eprintln!("accept error: {error}");
+        }
+    });
+
+    // Accept loop
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => {
+                break;
+            }
+            accept_result = listener.accept() => match accept_result {
+                Ok((stream, _addr)) => {
+                    let state = state.clone();
+                    let shutdown = shutdown.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_client(stream, state, shutdown).await {
+                            let _ = util::log_daemon(&format!("client error: {}", e));
+                        }
+                    });
+                }
+                Err(e) => {
+                    let _ = util::log_daemon(&format!("accept error: {}", e));
+                }
             }
         }
     }
-    let _ = log_daemon("daemon shutdown");
-    let _ = fs::remove_file(socket);
+
+    std::fs::remove_file(&socket_path).ok();
     Ok(())
 }
 
-pub fn run_client(request: WireRequest, json: bool) -> Result<()> {
-    let response = daemon_request(request)?;
-    if let Some(ref data) = response.data {
-        if let Some(status) = data.get("status").and_then(|v| v.as_str()) {
-            if status == "disconnected" && !json {
-                eprintln!("[hint] Session is disconnected. Use --reconnect when connecting to auto-recover.");
-            }
-        }
-    }
-    if json {
-        println!("{}", serde_json::to_string_pretty(&response)?);
-        return Ok(());
-    }
-    print_human(response.data.unwrap_or(Value::Null))
-}
+async fn handle_client(
+    stream: tokio::net::UnixStream,
+    state: Arc<Mutex<ServerState>>,
+    shutdown: Arc<Notify>,
+) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-pub fn run_read_command(command: ReadCommand, json: bool) -> Result<()> {
-    if !command.follow {
-        return run_client(WireRequest::Read(command), json);
-    }
-    if !json {
-        bail!("agentssh session read --follow requires --json");
-    }
-
-    let started_at = now_ms();
-    loop {
-        let response = daemon_request(WireRequest::Read(command.clone()))?;
-        let data = response.data.unwrap_or(Value::Null);
-        println!("{}", serde_json::to_string(&serde_json::json!({
-            "session_id": data.get("session_id").cloned().unwrap_or(Value::Null),
-            "output": data.get("output").cloned().unwrap_or(Value::Null),
-        }))?);
-
-        let status = data
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        if matches!(status, "closed" | "disconnected") {
-            return Ok(());
-        }
-
-        if now_ms().saturating_sub(started_at) >= u128::from(command.timeout) {
-            return Ok(());
-        }
-
-        sleep_ms(FOLLOW_POLL_MS);
-    }
-}
-
-fn handle_client(mut stream: UnixStream, state: &Arc<Mutex<ServerState>>) -> Result<bool> {
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
-    if line.trim().is_empty() {
-        return Ok(false);
+
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            return Ok(()); // client disconnected
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let request: WireRequest = match serde_json::from_str(trimmed) {
+            Ok(r) => r,
+            Err(e) => {
+                let resp = WireResponse {
+                    ok: false,
+                    data: None,
+                    error: Some(format!("invalid request: {}", e)),
+                };
+                let out = serde_json::to_string(&resp)? + "\n";
+                writer.write_all(out.as_bytes()).await?;
+                continue;
+            }
+        };
+
+        let should_shutdown = matches!(&request, WireRequest::Shutdown);
+
+        let mut st = state.lock().await;
+        let response = handle_request(request, &mut st).await;
+        drop(st);
+
+        let out = serde_json::to_string(&response)? + "\n";
+        writer.write_all(out.as_bytes()).await?;
+
+        if should_shutdown {
+            shutdown.notify_waiters();
+            return Ok(());
+        }
     }
-    let request: WireRequest = serde_json::from_str(line.trim()).context("parse daemon request")?;
-    if matches!(request, WireRequest::Shutdown) {
-        write_wire(&mut stream, Ok(serde_json::json!({ "event": "shutdown" })))?;
-        return Ok(true);
-    }
-    let result = {
-        let mut guard = state.lock().map_err(|_| anyhow::anyhow!("daemon state lock poisoned"))?;
-        handle_request(request, &mut guard)
-    };
-    write_wire(&mut stream, result)?;
-    Ok(false)
 }
 
-fn handle_request(request: WireRequest, state: &mut ServerState) -> Result<Value> {
+// ---------------------------------------------------------------------------
+// Request handler
+// ---------------------------------------------------------------------------
+
+async fn handle_request(request: WireRequest, state: &mut ServerState) -> WireResponse {
     match request {
-        WireRequest::Connect(command) => {
-            let response = daemon_connect(command, state)?;
-            if let (Some(session_id), Some(host), Some(port)) = (
-                response.get("session_id").and_then(Value::as_str),
-                response.get("host").and_then(Value::as_str),
-                response.get("port").and_then(Value::as_u64),
-            ) {
-                let _ = log_daemon(&format!("session {} created on {}:{}", session_id, host, port));
+        // -- Session lifecycle --
+        WireRequest::Connect(cmd) => {
+            match session::daemon_connect(&cmd, state).await {
+                Ok(v) => WireResponse { ok: true, data: Some(v), error: None },
+                Err(e) => WireResponse { ok: false, data: None, error: Some(e.to_string()) },
             }
-            Ok(response)
-        },
-        WireRequest::Send(command) => daemon_send(command, state),
-        WireRequest::Exec(command) => daemon_exec(command, state),
-        WireRequest::Spawn(command) => daemon_spawn(command, state),
-        WireRequest::Read(command) => daemon_read(command, state),
-        WireRequest::Resize(command) => daemon_resize(command, state),
-        WireRequest::Signal(command) => daemon_signal(command, state),
-        WireRequest::Status(command) => daemon_status(&command.session_id, state),
-        WireRequest::Ping(command) => daemon_ping(&command.session_id, state),
-        WireRequest::List => {
-            let all_sessions = state
-                .sessions
-                .values()
-                .map(|session| crate::ssh_backend::SessionMetadataForTesting {
-                    id: session.id.clone(),
-                    connection_id: session.connection_id.clone(),
-                })
-                .collect::<Vec<_>>();
-            Ok(serde_json::json!({
-                "sessions": state
-                    .sessions
-                    .values()
-                    .map(|session| session_summary(session, &all_sessions))
-                    .collect::<Vec<_>>()
-            }))
         }
-        WireRequest::Close(command) => {
-            let mut session = state
+
+        WireRequest::Spawn(cmd) => {
+            match session::daemon_spawn(&cmd, state).await {
+                Ok(v) => WireResponse { ok: true, data: Some(v), error: None },
+                Err(e) => WireResponse { ok: false, data: None, error: Some(e.to_string()) },
+            }
+        }
+
+        WireRequest::Close(cmd) => {
+            match session::daemon_close(&cmd.session_id, state).await {
+                Ok(v) => WireResponse { ok: true, data: Some(v), error: None },
+                Err(e) => WireResponse { ok: false, data: None, error: Some(e.to_string()) },
+            }
+        }
+
+        // -- Session I/O --
+        WireRequest::Send(cmd) => {
+            let pairs = cmd.expect_pairs().unwrap_or_default();
+            match session::daemon_send(
+                &cmd.session_id,
+                &cmd.input,
+                cmd.crlf,
+                pairs,
+                if cmd.wait_ms > 0 { Some(cmd.wait_ms) } else { None },
+                cmd.wait_idle,
+                cmd.wait_for_exit,
+                state,
+            )
+            .await
+            {
+                Ok(v) => WireResponse { ok: true, data: Some(v), error: None },
+                Err(e) => WireResponse { ok: false, data: None, error: Some(e.to_string()) },
+            }
+        }
+
+        WireRequest::Read(cmd) => {
+            let strip = if cmd.raw { Some(false) } else { Some(true) };
+            let wait = if cmd.wait_ms > 0 { Some(cmd.wait_ms) } else { None };
+            let offset = cmd.offset.unwrap_or(0);
+            match session::daemon_read(
+                &cmd.session_id,
+                offset,
+                cmd.limit,
+                wait,
+                strip,
+                state,
+            )
+            .await
+            {
+                Ok(v) => WireResponse { ok: true, data: Some(v), error: None },
+                Err(e) => WireResponse { ok: false, data: None, error: Some(e.to_string()) },
+            }
+        }
+
+        WireRequest::Exec(cmd) => {
+            let command = cmd.command.join(" ");
+            match session::daemon_exec(
+                &cmd.session_id,
+                &command,
+                Some(cmd.timeout),
+                state,
+            )
+            .await
+            {
+                Ok(v) => WireResponse { ok: true, data: Some(v), error: None },
+                Err(e) => WireResponse { ok: false, data: None, error: Some(e.to_string()) },
+            }
+        }
+
+        WireRequest::Resize(cmd) => {
+            match session::daemon_resize(&cmd.session_id, cmd.cols, cmd.rows, state).await {
+                Ok(v) => WireResponse { ok: true, data: Some(v), error: None },
+                Err(e) => WireResponse { ok: false, data: None, error: Some(e.to_string()) },
+            }
+        }
+
+        WireRequest::Signal(cmd) => {
+            match session::daemon_signal(&cmd.session_id, &cmd.signal, state).await {
+                Ok(v) => WireResponse { ok: true, data: Some(v), error: None },
+                Err(e) => WireResponse { ok: false, data: None, error: Some(e.to_string()) },
+            }
+        }
+
+        WireRequest::Status(cmd) => {
+            match session::daemon_status(&cmd.session_id, state).await {
+                Ok(v) => WireResponse { ok: true, data: Some(v), error: None },
+                Err(e) => WireResponse { ok: false, data: None, error: Some(e.to_string()) },
+            }
+        }
+
+        WireRequest::Ping(cmd) => {
+            match session::daemon_ping(&cmd.session_id, state).await {
+                Ok(v) => WireResponse { ok: true, data: Some(v), error: None },
+                Err(e) => WireResponse { ok: false, data: None, error: Some(e.to_string()) },
+            }
+        }
+
+        WireRequest::List => {
+            let sessions: Vec<Value> = state
                 .sessions
-                .remove(&command.session_id)
-                .ok_or_else(|| anyhow::anyhow!("session '{}' not found. Use 'agentssh session list' to see active sessions.", command.session_id))?;
-            let connection_id = session.connection_id.clone();
-            let _ = session.shell.close();
-            let _ = session.shell.wait_close();
-            if let Some(connection) = state.connections.get_mut(&connection_id) {
-                connection.refcount = connection.refcount.saturating_sub(1);
-                if connection.refcount == 0 {
-                    state.connections.remove(&connection_id);
+                .iter()
+                .map(|(_, s)| s.summary(&state.sessions))
+                .collect();
+            WireResponse { ok: true, data: Some(json!({"sessions": sessions})), error: None }
+        }
+
+        // -- Proxy --
+        WireRequest::ProxyCreate(cmd) => {
+            let proxy_mode = match crate::proxy::proxy_mode_from_command(
+                cmd.local.as_deref(),
+                cmd.remote.as_deref(),
+                cmd.socks5.as_deref(),
+            ) {
+                Ok(m) => m,
+                Err(e) => return WireResponse { ok: false, data: None, error: Some(e.to_string()) },
+            };
+            match crate::proxy::daemon_proxy_create(&cmd.connect, &proxy_mode, state).await {
+                Ok(v) => WireResponse { ok: true, data: Some(v), error: None },
+                Err(e) => WireResponse { ok: false, data: None, error: Some(e.to_string()) },
+            }
+        }
+
+        WireRequest::ProxyList => {
+            let list = crate::proxy::proxy_list(&state.proxies);
+            WireResponse { ok: true, data: Some(list), error: None }
+        }
+
+        WireRequest::ProxyPing(cmd) => {
+            match crate::proxy::proxy_ping(&cmd.proxy_id, &state.proxies) {
+                Ok(v) => WireResponse { ok: true, data: Some(v), error: None },
+                Err(e) => WireResponse { ok: false, data: None, error: Some(e.to_string()) },
+            }
+        }
+
+        WireRequest::ProxyClose(cmd) => {
+            let proxy_id = cmd.proxy_id.unwrap_or_default();
+            match crate::proxy::proxy_close(&proxy_id, cmd.all, state).await {
+                Ok(v) => WireResponse { ok: true, data: Some(v), error: None },
+                Err(e) => WireResponse { ok: false, data: None, error: Some(e.to_string()) },
+            }
+        }
+
+        // -- File transfer --
+        WireRequest::Upload(cmd) => {
+            match crate::sftp::daemon_upload(&cmd, state).await {
+                Ok(v) => WireResponse { ok: true, data: Some(v), error: None },
+                Err(e) => WireResponse { ok: false, data: None, error: Some(e.to_string()) },
+            }
+        }
+
+        WireRequest::Download(cmd) => {
+            match crate::sftp::daemon_download(&cmd, state).await {
+                Ok(v) => WireResponse { ok: true, data: Some(v), error: None },
+                Err(e) => WireResponse { ok: false, data: None, error: Some(e.to_string()) },
+            }
+        }
+
+        WireRequest::Ls(cmd) => {
+            match crate::sftp::daemon_ls(&cmd, state).await {
+                Ok(v) => WireResponse { ok: true, data: Some(v), error: None },
+                Err(e) => WireResponse { ok: false, data: None, error: Some(e.to_string()) },
+            }
+        }
+
+        WireRequest::Write(cmd) => {
+            match crate::sftp::daemon_write_file(&cmd, state).await {
+                Ok(v) => WireResponse { ok: true, data: Some(v), error: None },
+                Err(e) => WireResponse { ok: false, data: None, error: Some(e.to_string()) },
+            }
+        }
+
+        WireRequest::ReadFile(cmd) => {
+            match crate::sftp::daemon_read_file(&cmd, state).await {
+                Ok(v) => WireResponse { ok: true, data: Some(v), error: None },
+                Err(e) => WireResponse { ok: false, data: None, error: Some(e.to_string()) },
+            }
+        }
+
+        WireRequest::DeleteFile(cmd) => {
+            match crate::sftp::daemon_delete(&cmd, state).await {
+                Ok(v) => WireResponse { ok: true, data: Some(v), error: None },
+                Err(e) => WireResponse { ok: false, data: None, error: Some(e.to_string()) },
+            }
+        }
+
+        WireRequest::EditFile(cmd) => {
+            match crate::sftp::daemon_edit(&cmd, state).await {
+                Ok(v) => WireResponse { ok: true, data: Some(v), error: None },
+                Err(e) => WireResponse { ok: false, data: None, error: Some(e.to_string()) },
+            }
+        }
+
+        // -- Daemon lifecycle --
+        WireRequest::DaemonStatus => {
+            WireResponse {
+                ok: true,
+                data: Some(json!({
+                    "pid": std::process::id(),
+                    "started_at": state.started_at,
+                    "sessions": state.sessions.len(),
+                    "connections": state.connections.len(),
+                    "proxies": state.proxies.len(),
+                })),
+                error: None,
+            }
+        }
+
+        WireRequest::Shutdown => {
+            WireResponse { ok: true, data: Some(json!({"message": "shutting down"})), error: None }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat
+// ---------------------------------------------------------------------------
+
+async fn heartbeat(state: &mut ServerState) -> Result<()> {
+    let session_ids: Vec<String> = state.sessions.keys().cloned().collect();
+    for sid in &session_ids {
+        if let Some(session) = state.sessions.get(sid) {
+            let dead = *session.drain_dead.lock().unwrap();
+            if dead {
+                let status = session.status.lock().unwrap().clone();
+                if status == "running" {
+                    *session.status.lock().unwrap() = "disconnected".to_string();
+                    util::log_daemon(&format!("session {} drain task died, marking disconnected", sid))?;
                 }
             }
-            let _ = log_daemon(&format!("session {} closed", command.session_id));
-            Ok(serde_json::json!({ "session_id": command.session_id, "status": "closed" }))
-        }
-        WireRequest::Upload(command) => daemon_upload(command, state),
-        WireRequest::Download(command) => daemon_download(command, state),
-        WireRequest::Ls(command) => daemon_ls(command, state),
-        WireRequest::Write(command) => daemon_write(command, state),
-        WireRequest::ReadFile(command) => daemon_file_read(command, state),
-        WireRequest::DeleteFile(command) => daemon_file_delete(command, state),
-        WireRequest::EditFile(command) => daemon_file_edit(command, state),
-        WireRequest::ProxyCreate(command) => {
-            let response = daemon_proxy_create(command, state)?;
-            if let (Some(proxy_id), Some(local_addr)) = (
-                response.get("proxy_id").and_then(Value::as_str),
-                response.get("local_addr").and_then(Value::as_str),
-            ) {
-                let _ = log_daemon(&format!("proxy {} listening on {}", proxy_id, local_addr));
+
+            let should_reconnect = session.reconnect && *session.status.lock().unwrap() == "disconnected";
+            if should_reconnect {
+                let connect_args = session.connect_args.clone();
+                let cols = session.cols;
+                let rows = session.rows;
+                let output = session.output.clone();
+                let status = session.status.clone();
+                let exit_status = session.exit_status.clone();
+                let exit_signal = session.exit_signal.clone();
+                let drain_dead = session.drain_dead.clone();
+                let updated_at = session.updated_at.clone();
+                let session_id = sid.clone();
+                let _ = session;
+                util::log_daemon(&format!("attempting reconnect for session {}", session_id))?;
+                match attempt_reconnect(
+                    &connect_args,
+                    cols,
+                    rows,
+                    output,
+                    status,
+                    exit_status,
+                    exit_signal,
+                    drain_dead,
+                    updated_at,
+                    state,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        util::log_daemon(&format!("session {} reconnected", session_id))?;
+                    }
+                    Err(e) => {
+                        util::log_daemon(&format!("reconnect failed for {}: {}", session_id, e))?;
+                    }
+                }
             }
-            Ok(response)
         }
-        WireRequest::ProxyList => daemon_proxy_list(state),
-        WireRequest::ProxyClose(command) => daemon_proxy_close(command, state),
-        WireRequest::ProxyPing(command) => daemon_proxy_ping(command, state),
-        WireRequest::DaemonStatus => {
-            let all_sessions = state
-                .sessions
-                .values()
-                .map(|session| crate::ssh_backend::SessionMetadataForTesting {
-                    id: session.id.clone(),
-                    connection_id: session.connection_id.clone(),
-                })
-                .collect::<Vec<_>>();
-            Ok(serde_json::json!({
-                "running": true,
-                "pid": std::process::id(),
-                "socket": runtime_socket_path().display().to_string(),
-                "uptime_ms": now_ms().saturating_sub(state.started_at),
-                "connections": state.connections.len(),
-                "sessions": state.sessions.len(),
-                "proxies": state.proxies.len(),
-                "session_list": state
-                    .sessions
-                    .values()
-                    .map(|session| session_summary(session, &all_sessions))
-                    .collect::<Vec<_>>()
-            }))
-        }
-        WireRequest::Shutdown => unreachable!(),
     }
+    Ok(())
 }
 
-fn daemon_request(request: WireRequest) -> Result<WireResponse> {
-    ensure_daemon()?;
-    let socket = runtime_socket_path();
-    let mut stream = UnixStream::connect(&socket)
-        .with_context(|| format!("connect daemon {}", socket.display()))?;
-    stream.set_read_timeout(Some(Duration::from_secs(60)))
-        .context("set daemon socket timeout")?;
-    stream.write_all(serde_json::to_string(&request)?.as_bytes())?;
-    stream.write_all(b"\n")?;
-    let mut line = String::new();
-    match BufReader::new(stream).read_line(&mut line) {
-        Ok(_) => {},
-        Err(e) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock => {
-            bail!("Daemon request timed out after 60s. The daemon may be unresponsive. Try 'agentssh daemon shutdown' to restart.");
-        },
-        Err(e) => return Err(e).context("read daemon response"),
-    }
-    let response: WireResponse = serde_json::from_str(line.trim()).context("parse daemon response")?;
-    if !response.ok {
-        bail!("{}", response.error.unwrap_or_else(|| "daemon request failed".to_string()));
-    }
+async fn attempt_reconnect(
+    connect_args: &ConnectArgs,
+    cols: u32,
+    rows: u32,
+    output: Arc<std::sync::Mutex<session::OutputBuffer>>,
+    status: Arc<std::sync::Mutex<String>>,
+    exit_status: Arc<std::sync::Mutex<Option<i32>>>,
+    exit_signal: Arc<std::sync::Mutex<Option<String>>>,
+    drain_dead: Arc<std::sync::Mutex<bool>>,
+    updated_at: Arc<std::sync::Mutex<u64>>,
+    _state: &mut ServerState,
+) -> Result<()> {
+    let (handle, _host, _port, _username) = connection::connect_with_info(connect_args).await?;
+    let channel = session::open_pty(&handle, cols, rows).await?;
+    *drain_dead.lock().unwrap() = false;
+    *status.lock().unwrap() = "running".to_string();
+    session::spawn_drain_task(channel, output, status, exit_status, exit_signal, drain_dead, updated_at).await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Client-side: talk to daemon
+// ---------------------------------------------------------------------------
+
+pub fn daemon_request(request: WireRequest) -> Result<WireResponse> {
+    let socket_path = util::runtime_socket_path();
+    let mut stream = StdUnixStream::connect(&socket_path)
+        .with_context(|| format!("connecting to daemon at {}", socket_path.display()))?;
+
+    use std::io::{BufRead, Write};
+    let json = serde_json::to_string(&request)? + "\n";
+    stream.write_all(json.as_bytes())?;
+
+    let mut reader = std::io::BufReader::new(stream);
+    let mut response_line = String::new();
+    reader.read_line(&mut response_line)?;
+
+    let response: WireResponse = serde_json::from_str(response_line.trim())
+        .with_context(|| "parsing daemon response")?;
+
     Ok(response)
 }
 
-fn ensure_daemon() -> Result<()> {
-    let socket = runtime_socket_path();
-    if UnixStream::connect(&socket).is_ok() {
-        return Ok(());
-    }
-    if socket.exists() {
-        let _ = fs::remove_file(&socket);
-    }
-    ProcessCommand::new(std::env::current_exe()?)
-        .args(["daemon", "serve"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to start agentssh daemon. Is agentssh installed and in PATH?")?;
-    for _ in 0..50 {
-        if UnixStream::connect(&socket).is_ok() {
-            return Ok(());
+pub fn run_client(request: WireRequest, json_output: bool) -> Result<()> {
+    ensure_daemon()?;
+    let response = daemon_request(request)?;
+
+    match response {
+        WireResponse { ok: true, data: Some(data), .. } => {
+            if json_output {
+                util::print_json(&data)?;
+            } else {
+                print_human(&data);
+            }
         }
-        thread::sleep(Duration::from_millis(50));
+        WireResponse { ok: false, error: Some(msg), .. } => {
+            if json_output {
+                println!("{}", serde_json::to_string(&json!({"ok": false, "error": msg}))?);
+            } else {
+                eprintln!("error: {}", msg);
+            }
+            std::process::exit(1);
+        }
+        WireResponse { ok: true, data: None, .. } => {
+            if json_output {
+                println!("{}", serde_json::to_string(&json!({"ok": true}))?);
+            }
+        }
+        _ => {}
     }
-    bail!(
-        "agentssh daemon failed to start at {}. Check if another instance is already running.",
-        socket.display()
-    )
+    Ok(())
 }
 
-fn spawn_heartbeat(state: Arc<Mutex<ServerState>>) {
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_millis(HEARTBEAT_INTERVAL_MS));
-        let Ok(mut guard) = state.lock() else {
-            break;
-        };
-        let mut alive = 0_usize;
-        let checked = guard.sessions.len();
-        let mut reconnect_candidates = Vec::new();
-        for session in guard.sessions.values_mut() {
-            let previous_status = session.status.clone();
-            refresh_session_state(session);
-            if session.status == "running" {
-                alive += 1;
-            }
-            if previous_status != "disconnected" && session.status == "disconnected" {
-                let _ = log_daemon(&format!("session {} disconnected", session.id));
-                if session.reconnect {
-                    reconnect_candidates.push(session.id.clone());
+pub fn run_read_command(command: ReadCommand, json_output: bool) -> Result<()> {
+    ensure_daemon()?;
+
+    if !command.follow {
+        return run_client(WireRequest::Read(command), json_output);
+    }
+
+    let session_id = command.session_id.clone();
+    let limit = command.limit;
+    let raw = command.raw;
+    let timeout_ms = command.timeout;
+    let mut total_offset = command.offset.unwrap_or(0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+    loop {
+        let request = WireRequest::Read(ReadCommand {
+            session_id: session_id.clone(),
+            offset: Some(total_offset),
+            limit,
+            wait_ms: 500,
+            follow: false,
+            raw,
+            strip_ansi: false,
+            timeout: timeout_ms,
+        });
+
+        let response = daemon_request(request)?;
+
+        match response {
+            WireResponse { ok: true, data: Some(data), .. } => {
+                let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let output = data.get("output");
+                let next_offset = output
+                    .and_then(|o| o.get("offset"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(total_offset as u64) as usize;
+                total_offset = next_offset;
+
+                if json_output {
+                    println!("{}", serde_json::to_string(&data)?);
+                } else {
+                    let text = output
+                        .and_then(|o| o.get("text"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !text.is_empty() {
+                        print!("{}", text);
+                    }
+                }
+
+                if status != "running" {
+                    break;
                 }
             }
-        }
-        let mut next_id = guard.next_connection_id;
-        for sid in reconnect_candidates {
-            let mut session = match guard.sessions.remove(&sid) {
-                Some(s) => s,
-                None => continue,
-            };
-            if let Some((new_ssh, _old_shell)) = attempt_reconnect(&mut session) {
-                next_id += 1;
-                let new_conn_id = format!("c{}", next_id);
-                session.connection_id = new_conn_id.clone();
-                guard.connections.insert(
-                    new_conn_id,
-                    SharedConnection {
-                        ssh: new_ssh,
-                        refcount: 1,
-                    },
-                );
+            WireResponse { ok: false, error: Some(msg), .. } => {
+                if json_output {
+                    println!("{}", serde_json::to_string(&json!({"ok": false, "error": msg}))?);
+                } else {
+                    eprintln!("error: {}", msg);
+                }
+                break;
             }
-            guard.sessions.insert(sid, session);
+            _ => break,
         }
-        guard.next_connection_id = next_id;
-        let _ = log_daemon(&format!("heartbeat: {} sessions checked, {} alive", checked, alive));
-    });
-}
 
-fn write_wire(stream: &mut UnixStream, result: Result<Value>) -> Result<()> {
-    let response = match result {
-        Ok(data) => WireResponse {
-            ok: true,
-            data: Some(data),
-            error: None,
-        },
-        Err(error) => {
-            let rendered = format!("{error:#}");
-            let _ = log_daemon(&format!("request error: {rendered}"));
-            WireResponse {
-                ok: false,
-                data: None,
-                error: Some(rendered),
-            }
+        if std::time::Instant::now() > deadline {
+            break;
         }
-    };
-    stream.write_all(serde_json::to_string(&response)?.as_bytes())?;
-    stream.write_all(b"\n")?;
+    }
+
     Ok(())
 }
 
-fn print_human(data: Value) -> Result<()> {
-    // Case 1: session read output — extract /output/text
-    if let Some(output) = data.pointer("/output/text").and_then(Value::as_str) {
-        if !output.is_empty() {
-            println!("{output}");
-        }
+pub fn ensure_daemon() -> Result<()> {
+    let socket_path = util::runtime_socket_path();
+
+    if StdUnixStream::connect(&socket_path).is_ok() {
         return Ok(());
     }
-    // Case 2: exec-style response — print stdout/stderr directly
-    if data.get("stdout").is_some() || data.get("exit_status").is_some() {
-        if let Some(stdout) = data.get("stdout").and_then(Value::as_str) {
-            if !stdout.is_empty() {
-                print!("{stdout}");
-            }
+
+    if Path::new(&socket_path).exists() {
+        std::fs::remove_file(&socket_path).ok();
+    }
+
+    let current_exe = std::env::current_exe().context("getting current executable path")?;
+    let mut cmd = Command::new(current_exe);
+    cmd.args(["daemon", "serve"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    let child = cmd.spawn().context("spawning daemon")?;
+    drop(child);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if StdUnixStream::connect(&socket_path).is_ok() {
+            return Ok(());
         }
-        if let Some(stderr) = data.get("stderr").and_then(Value::as_str) {
+        if std::time::Instant::now() > deadline {
+            bail!("daemon did not start within 5 seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Output formatting
+// ---------------------------------------------------------------------------
+
+fn print_human(data: &Value) {
+    if let Some(text) = data.get("output").and_then(|o| o.get("text")).and_then(|v| v.as_str()) {
+        if !text.is_empty() {
+            print!("{}", text);
+        }
+    } else if let Some(stdout) = data.get("stdout").and_then(|v| v.as_str()) {
+        if !stdout.is_empty() {
+            print!("{}", stdout);
+        }
+        if let Some(stderr) = data.get("stderr").and_then(|v| v.as_str()) {
             if !stderr.is_empty() {
-                eprint!("{stderr}");
+                eprint!("{}", stderr);
             }
         }
-        if let Some(exit_status) = data.get("exit_status").and_then(Value::as_i64) {
-            if exit_status != 0 {
-                bail!("remote command exited with status {exit_status}");
-            }
-        }
-        return Ok(());
+    } else if let Some(content) = data.get("content").and_then(|v| v.as_str()) {
+        print!("{}", content);
+    } else {
+        println!("{}", serde_json::to_string_pretty(data).unwrap());
     }
-    // Case 3: file read response — print content directly
-    if let Some(content) = data.get("content").and_then(Value::as_str) {
-        if !content.is_empty() {
-            print!("{content}");
-        }
-        return Ok(());
-    }
-    // Fallback: pretty-print JSON
-    println!("{}", serde_json::to_string_pretty(&data)?);
-    Ok(())
 }
 
 pub fn daemon_install() -> Result<()> {
-    if !cfg!(target_os = "linux") {
-        bail!("systemd service installation is only supported on Linux");
-    }
-
-    let exe = std::env::current_exe().context("get current executable path")?;
-    let exe_str = exe.to_string_lossy();
-
-    let unit = format!(
-        "[Unit]\n\
-         Description=AgentSSH daemon for AI agent SSH workflows\n\
-         After=network.target\n\
-         \n\
-         [Service]\n\
-         Type=simple\n\
-         ExecStart={exe} daemon serve\n\
-         Restart=on-failure\n\
-         RestartSec=5\n\
-         \n\
-         [Install]\n\
-         WantedBy=default.target\n",
-        exe = exe_str
-    );
-
-    let systemd_dir = dirs::home_dir()
-        .context("cannot find home directory")?
-        .join(".config")
-        .join("systemd")
-        .join("user");
-
-    fs::create_dir_all(&systemd_dir)
-        .context("create systemd user directory")?;
-
-    let unit_path = systemd_dir.join("agentssh.service");
-    fs::write(&unit_path, &unit)
-        .context("write service unit file")?;
-
-    println!("Installed systemd user service to {}", unit_path.display());
-
-    let status = ProcessCommand::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status()
-        .context("run systemctl daemon-reload")?;
-    if !status.success() {
-        bail!("systemctl --user daemon-reload failed");
-    }
-
-    let status = ProcessCommand::new("systemctl")
-        .args(["--user", "enable", "--now", "agentssh.service"])
-        .status()
-        .context("run systemctl enable --now")?;
-    if !status.success() {
-        bail!("systemctl --user enable --now agentssh.service failed");
-    }
-
-    println!("agentssh daemon service enabled and started.");
-    println!("Use 'systemctl --user status agentssh' to check status.");
+    let socket_path = util::runtime_socket_path();
+    let exe = std::env::current_exe()?.display().to_string();
+    println!("Daemon binary: {}", exe);
+    println!("Socket path: {}", socket_path.display());
+    println!("To install as systemd service, create a unit file.");
     Ok(())
 }
 
 pub fn daemon_uninstall() -> Result<()> {
-    if !cfg!(target_os = "linux") {
-        bail!("systemd service management is only supported on Linux");
+    let socket_path = util::runtime_socket_path();
+    if Path::new(&socket_path).exists() {
+        std::fs::remove_file(&socket_path)?;
     }
-
-    let _ = ProcessCommand::new("systemctl")
-        .args(["--user", "stop", "agentssh.service"])
-        .status();
-
-    let _ = ProcessCommand::new("systemctl")
-        .args(["--user", "disable", "agentssh.service"])
-        .status();
-
-    let unit_path = dirs::home_dir()
-        .context("cannot find home directory")?
-        .join(".config")
-        .join("systemd")
-        .join("user")
-        .join("agentssh.service");
-
-    if unit_path.exists() {
-        fs::remove_file(&unit_path).context("remove service unit file")?;
-    }
-
-    let _ = ProcessCommand::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status();
-
-    println!("agentssh daemon service uninstalled.");
+    println!("Daemon socket removed.");
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn follow_read_requires_json_output() {
-        let command = ReadCommand {
-            session_id: "s1".to_string(),
-            offset: None,
-            limit: 10,
-            wait_ms: 0,
-            follow: true,
-            raw: false,
-            strip_ansi: false,
-            timeout: 1,
-        };
-
-        let error = run_read_command(command, false).expect_err("follow without json should fail");
-        assert!(error.to_string().contains("requires --json"));
-    }
 }
