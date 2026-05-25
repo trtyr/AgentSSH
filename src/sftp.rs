@@ -1,819 +1,530 @@
-use crate::cli::{DeleteFileCommand, EditFileCommand, ListCommand, ReadFileCommand, TransferCommand, WriteCommand};
-use crate::connection::connect_with_info;
+use crate::cli::*;
+use crate::connection;
 use crate::kernel::ServerState;
-use crate::util::{emit_message, stat_json};
-use anyhow::{Context, Result, anyhow};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as B64;
-use regex;
-use serde_json::Value;
-use std::fs;
-use std::io::{Read, Write};
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
 use std::path::Path;
+use tokio::io::AsyncWriteExt;
 
-const EXEC_UPLOAD_BASE64_LIMIT: usize = 30_000;
+// ---------------------------------------------------------------------------
+// Daemon file operations (routed through daemon, use existing connection)
+// ---------------------------------------------------------------------------
 
-pub fn daemon_upload(command: TransferCommand, state: &mut ServerState) -> Result<Value> {
-    let session_id = command
-        .session_id
-        .clone()
-        .ok_or_else(|| anyhow!("--session-id is required for this operation. Get one with 'agentssh connect'."))?;
-    let connection_id = state
-        .sessions
-        .get(&session_id)
-        .ok_or_else(|| anyhow!("session '{}' not found. Use 'agentssh session list' to see active sessions.", session_id))?
-        .connection_id
-        .clone();
-
-    let connection = state
-        .connections
-        .get_mut(&connection_id)
-        .ok_or_else(|| anyhow!("connection '{}' not found", connection_id))?;
-    connection.ssh.set_blocking(true);
-    let result = upload_with_method(&connection.ssh, &command, Some(&session_id));
-    connection.ssh.set_blocking(false);
-    result
+pub async fn daemon_upload(cmd: &TransferCommand, state: &mut ServerState) -> Result<Value> {
+    let handle = get_handle(cmd.session_id.as_deref(), state)?;
+    let local = cmd.local.to_string_lossy();
+    let remote = cmd.remote.to_string_lossy();
+    do_upload(&handle, &local, &remote, &cmd.method).await
 }
 
-pub fn daemon_download(command: TransferCommand, state: &mut ServerState) -> Result<Value> {
-    let session_id = command
-        .session_id
-        .clone()
-        .ok_or_else(|| anyhow!("--session-id is required for this operation. Get one with 'agentssh connect'."))?;
-    let connection_id = state
-        .sessions
-        .get(&session_id)
-        .ok_or_else(|| anyhow!("session '{}' not found. Use 'agentssh session list' to see active sessions.", session_id))?
-        .connection_id
-        .clone();
-
-    let connection = state
-        .connections
-        .get_mut(&connection_id)
-        .ok_or_else(|| anyhow!("connection '{}' not found", connection_id))?;
-    connection.ssh.set_blocking(true);
-    let result = download_with_method(&connection.ssh, &command, Some(&session_id));
-    connection.ssh.set_blocking(false);
-    result
+pub async fn daemon_download(cmd: &TransferCommand, state: &mut ServerState) -> Result<Value> {
+    let handle = get_handle(cmd.session_id.as_deref(), state)?;
+    let local = cmd.local.to_string_lossy();
+    let remote = cmd.remote.to_string_lossy();
+    do_download(&handle, &local, &remote, &cmd.method).await
 }
 
-pub fn daemon_ls(command: ListCommand, state: &mut ServerState) -> Result<Value> {
-    let session_id = command
-        .session_id
-        .clone()
-        .ok_or_else(|| anyhow!("--session-id is required for this operation. Get one with 'agentssh connect'."))?;
-    let connection_id = state
-        .sessions
-        .get(&session_id)
-        .ok_or_else(|| anyhow!("session '{}' not found. Use 'agentssh session list' to see active sessions.", session_id))?
-        .connection_id
-        .clone();
-
-    let connection = state
-        .connections
-        .get_mut(&connection_id)
-        .ok_or_else(|| anyhow!("connection '{}' not found", connection_id))?;
-    connection.ssh.set_blocking(true);
-    let result = ls_with_method(&connection.ssh, &command, Some(&session_id));
-    connection.ssh.set_blocking(false);
-    result
+pub async fn daemon_ls(cmd: &ListCommand, state: &mut ServerState) -> Result<Value> {
+    let handle = get_handle(cmd.session_id.as_deref(), state)?;
+    let remote = cmd.remote.to_string_lossy();
+    do_ls(&handle, &remote, &cmd.method).await
 }
 
-pub fn run_upload_once(command: TransferCommand, json: bool) -> Result<()> {
-    let (session, _, _, _) = connect_with_info(command.connect.clone())?;
-    upload_with_method(&session, &command, None)?;
-    emit_message(
-        json,
-        "uploaded",
-        &format!("{} -> {} ({})", command.local.display(), command.remote.display(), command.method),
-    )
+pub async fn daemon_write_file(cmd: &WriteCommand, state: &mut ServerState) -> Result<Value> {
+    let handle = get_handle(cmd.session_id.as_deref(), state)?;
+    let remote = cmd.remote.to_string_lossy();
+    do_write(&handle, &remote, cmd.content.as_bytes(), &cmd.content.len(), &"auto").await
 }
 
-pub fn run_download_once(command: TransferCommand, json: bool) -> Result<()> {
-    let (session, _, _, _) = connect_with_info(command.connect.clone())?;
-    download_with_method(&session, &command, None)?;
-    emit_message(
-        json,
-        "downloaded",
-        &format!("{} -> {} ({})", command.remote.display(), command.local.display(), command.method),
-    )
+pub async fn daemon_read_file(cmd: &ReadFileCommand, state: &mut ServerState) -> Result<Value> {
+    let handle = get_handle(cmd.session_id.as_deref(), state)?;
+    let remote = cmd.remote.to_string_lossy();
+    do_read_file(&handle, &remote).await
 }
 
-pub fn run_ls_once(command: ListCommand, json: bool) -> Result<()> {
-    let (session, _, _, _) = connect_with_info(command.connect.clone())?;
-    let result = ls_with_method(&session, &command, None)?;
-    if json {
-        crate::util::print_json(&result)?;
-        return Ok(());
-    }
+pub async fn daemon_delete(cmd: &DeleteFileCommand, state: &mut ServerState) -> Result<Value> {
+    let handle = get_handle(cmd.session_id.as_deref(), state)?;
+    let remote = cmd.remote.to_string_lossy();
+    let recursive = cmd.recursive;
+    do_delete(&handle, &remote, recursive).await
+}
 
-    if let Some(entries) = result.get("entries").and_then(|value| value.as_array()) {
-        for entry in entries {
-            let stat = &entry["stat"];
-            let path = entry["path"].as_str().unwrap_or_default();
-            println!(
-                "{}\t{}\t{}",
-                stat["perm"].as_u64().unwrap_or_default(),
-                stat["size"].as_u64().unwrap_or_default(),
-                path
-            );
-        }
-        return Ok(());
-    }
+pub async fn daemon_edit(cmd: &EditFileCommand, state: &mut ServerState) -> Result<Value> {
+    let handle = get_handle(cmd.session_id.as_deref(), state)?;
+    let remote = cmd.remote.to_string_lossy();
+    do_edit(&handle, &remote, &cmd.find, &cmd.replace).await
+}
 
-    if let Some(output) = result.get("output").and_then(|value| value.as_array()) {
-        for line in output {
-            if let Some(line) = line.as_str() {
-                println!("{line}");
-            }
-        }
-    }
+// ---------------------------------------------------------------------------
+// One-shot operations (no daemon)
+// ---------------------------------------------------------------------------
+
+pub async fn upload_once(cmd: &TransferCommand, _json: bool) -> Result<()> {
+    let args = connection::resolve_connect_args(&cmd.connect)?;
+    let (handle, _, _, _) = connection::connect_with_info(&args).await?;
+    let local = cmd.local.to_string_lossy();
+    let remote = cmd.remote.to_string_lossy();
+    let result = do_upload(&handle, &local, &remote, &cmd.method).await?;
+    crate::util::print_json(&result)?;
     Ok(())
 }
 
-pub fn daemon_write(command: WriteCommand, state: &mut ServerState) -> Result<Value> {
-    let session_id = command
-        .session_id
-        .clone()
-        .ok_or_else(|| anyhow!("--session-id is required for this operation. Get one with 'agentssh connect'."))?;
-    let connection_id = state
-        .sessions
-        .get(&session_id)
-        .ok_or_else(|| anyhow!("session '{}' not found. Use 'agentssh session list' to see active sessions.", session_id))?
-        .connection_id
-        .clone();
-
-    let connection = state
-        .connections
-        .get_mut(&connection_id)
-        .ok_or_else(|| anyhow!("connection '{}' not found", connection_id))?;
-    connection.ssh.set_blocking(true);
-    let result = write_with_method(&connection.ssh, &command, Some(&session_id));
-    connection.ssh.set_blocking(false);
-    result
-}
-
-pub fn run_write_once(command: WriteCommand, json: bool) -> Result<()> {
-    let (session, _, _, _) = connect_with_info(command.connect.clone())?;
-    write_with_method(&session, &command, None)?;
-    emit_message(
-        json,
-        "written",
-        &format!("{} bytes -> {} (sftp)", command.content.len(), command.remote.display()),
-    )
-}
-
-pub fn daemon_file_read(command: ReadFileCommand, state: &mut ServerState) -> Result<Value> {
-    let session_id = command
-        .session_id
-        .clone()
-        .ok_or_else(|| anyhow!("--session-id is required for this operation. Get one with 'agentssh connect'."))?;
-    let connection_id = state
-        .sessions
-        .get(&session_id)
-        .ok_or_else(|| anyhow!("session '{}' not found. Use 'agentssh session list' to see active sessions.", session_id))?
-        .connection_id
-        .clone();
-    let connection = state
-        .connections
-        .get_mut(&connection_id)
-        .ok_or_else(|| anyhow!("connection '{}' not found", connection_id))?;
-    connection.ssh.set_blocking(true);
-    let result = sftp_read(&connection.ssh, &command.remote, Some(&session_id));
-    connection.ssh.set_blocking(false);
-    result
-}
-
-pub fn run_read_once(command: ReadFileCommand, json: bool) -> Result<()> {
-    let (session, _, _, _) = connect_with_info(command.connect.clone())?;
-    let result = sftp_read(&session, &command.remote, None)?;
-    if json {
-        crate::util::print_json(&result)?;
-        return Ok(());
-    }
-    if let Some(content) = result.get("content").and_then(|v| v.as_str()) {
-        print!("{content}");
-    }
+pub async fn download_once(cmd: &TransferCommand, _json: bool) -> Result<()> {
+    let args = connection::resolve_connect_args(&cmd.connect)?;
+    let (handle, _, _, _) = connection::connect_with_info(&args).await?;
+    let local = cmd.local.to_string_lossy();
+    let remote = cmd.remote.to_string_lossy();
+    let result = do_download(&handle, &local, &remote, &cmd.method).await?;
+    crate::util::print_json(&result)?;
     Ok(())
 }
 
-pub fn daemon_file_delete(command: DeleteFileCommand, state: &mut ServerState) -> Result<Value> {
-    let session_id = command
-        .session_id
-        .clone()
-        .ok_or_else(|| anyhow!("--session-id is required for this operation. Get one with 'agentssh connect'."))?;
-    let connection_id = state
-        .sessions
-        .get(&session_id)
-        .ok_or_else(|| anyhow!("session '{}' not found. Use 'agentssh session list' to see active sessions.", session_id))?
-        .connection_id
-        .clone();
-    let connection = state
-        .connections
-        .get_mut(&connection_id)
-        .ok_or_else(|| anyhow!("connection '{}' not found", connection_id))?;
-    connection.ssh.set_blocking(true);
-    let result = delete_with_fallback(&connection.ssh, &command, Some(&session_id));
-    connection.ssh.set_blocking(false);
-    result
+pub async fn ls_once(cmd: &ListCommand, _json: bool) -> Result<()> {
+    let args = connection::resolve_connect_args(&cmd.connect)?;
+    let (handle, _, _, _) = connection::connect_with_info(&args).await?;
+    let remote = cmd.remote.to_string_lossy();
+    let result = do_ls(&handle, &remote, &cmd.method).await?;
+    crate::util::print_json(&result)?;
+    Ok(())
 }
 
-pub fn run_delete_once(command: DeleteFileCommand, json: bool) -> Result<()> {
-    let (session, _, _, _) = connect_with_info(command.connect.clone())?;
-    delete_with_fallback(&session, &command, None)?;
-    emit_message(json, "deleted", &command.remote.display().to_string())
+pub async fn write_once(cmd: &WriteCommand, _json: bool) -> Result<()> {
+    let args = connection::resolve_connect_args(&cmd.connect)?;
+    let (handle, _, _, _) = connection::connect_with_info(&args).await?;
+    let remote = cmd.remote.to_string_lossy();
+    let result = do_write(&handle, &remote, cmd.content.as_bytes(), &cmd.content.len(), &"auto").await?;
+    crate::util::print_json(&result)?;
+    Ok(())
 }
 
-pub fn daemon_file_edit(command: EditFileCommand, state: &mut ServerState) -> Result<Value> {
-    let session_id = command
-        .session_id
-        .clone()
-        .ok_or_else(|| anyhow!("--session-id is required for this operation. Get one with 'agentssh connect'."))?;
-    let connection_id = state
-        .sessions
-        .get(&session_id)
-        .ok_or_else(|| anyhow!("session '{}' not found. Use 'agentssh session list' to see active sessions.", session_id))?
-        .connection_id
-        .clone();
-    let connection = state
-        .connections
-        .get_mut(&connection_id)
-        .ok_or_else(|| anyhow!("connection '{}' not found", connection_id))?;
-    connection.ssh.set_blocking(true);
-    let result = sftp_edit(
-        &connection.ssh,
-        &command.remote,
-        &command.find,
-        &command.replace,
-        command.regex,
-        Some(&session_id),
-    );
-    connection.ssh.set_blocking(false);
-    result
+pub async fn read_once(cmd: &ReadFileCommand, _json: bool) -> Result<()> {
+    let args = connection::resolve_connect_args(&cmd.connect)?;
+    let (handle, _, _, _) = connection::connect_with_info(&args).await?;
+    let remote = cmd.remote.to_string_lossy();
+    let result = do_read_file(&handle, &remote).await?;
+    print!("{}", result.get("content").and_then(|v| v.as_str()).unwrap_or(""));
+    Ok(())
 }
 
-pub fn run_edit_once(command: EditFileCommand, json: bool) -> Result<()> {
-    let (session, _, _, _) = connect_with_info(command.connect.clone())?;
-    let result = sftp_edit(
-        &session,
-        &command.remote,
-        &command.find,
-        &command.replace,
-        command.regex,
-        None,
-    )?;
-    emit_message(
-        json,
-        "edited",
-        &format!(
-            "{} ({})",
-            command.remote.display(),
-            result
-                .get("replacements")
-                .and_then(|v| v.as_u64())
-                .map_or("?".to_string(), |n| n.to_string())
-        ),
-    )
+pub async fn delete_once(cmd: &DeleteFileCommand, _json: bool) -> Result<()> {
+    let args = connection::resolve_connect_args(&cmd.connect)?;
+    let (handle, _, _, _) = connection::connect_with_info(&args).await?;
+    let remote = cmd.remote.to_string_lossy();
+    let result = do_delete(&handle, &remote, cmd.recursive).await?;
+    crate::util::print_json(&result)?;
+    Ok(())
 }
 
-fn upload_with_method(session: &ssh2::Session, command: &TransferCommand, session_id: Option<&str>) -> Result<Value> {
-    match command.method.as_str() {
-        "sftp" => sftp_upload(session, &command.local, &command.remote, session_id),
-        "scp" => scp_upload(session, &command.local, &command.remote, session_id),
-        "auto" => sftp_upload(session, &command.local, &command.remote, session_id).or_else(|sftp_error| {
-            if !is_sftp_error(&sftp_error) {
-                return Err(sftp_error);
-            }
-
-            scp_upload(session, &command.local, &command.remote, session_id).or_else(|scp_error| {
-                exec_upload(session, &command.local, &command.remote, session_id).with_context(|| {
-                    format!(
-                        "auto upload fallback exhausted after SFTP error: {sftp_error}; SCP error: {scp_error}"
-                    )
-                })
-            })
-        }),
-        other => Err(anyhow!("unsupported transfer method '{other}'")),
-    }
+pub async fn edit_once(cmd: &EditFileCommand, _json: bool) -> Result<()> {
+    let args = connection::resolve_connect_args(&cmd.connect)?;
+    let (handle, _, _, _) = connection::connect_with_info(&args).await?;
+    let remote = cmd.remote.to_string_lossy();
+    let result = do_edit(&handle, &remote, &cmd.find, &cmd.replace).await?;
+    crate::util::print_json(&result)?;
+    Ok(())
 }
 
-fn download_with_method(session: &ssh2::Session, command: &TransferCommand, session_id: Option<&str>) -> Result<Value> {
-    match command.method.as_str() {
-        "sftp" => sftp_download(session, &command.remote, &command.local, session_id),
-        "scp" => scp_download(session, &command.remote, &command.local, session_id),
-        "auto" => sftp_download(session, &command.remote, &command.local, session_id).or_else(|sftp_error| {
-            if !is_sftp_error(&sftp_error) {
-                return Err(sftp_error);
-            }
+// ---------------------------------------------------------------------------
+// Core implementation
+// ---------------------------------------------------------------------------
 
-            scp_download(session, &command.remote, &command.local, session_id).or_else(|scp_error| {
-                exec_download(session, &command.remote, &command.local, session_id).with_context(|| {
-                    format!(
-                        "auto download fallback exhausted after SFTP error: {sftp_error}; SCP error: {scp_error}"
-                    )
-                })
-            })
-        }),
-        other => Err(anyhow!("unsupported transfer method '{other}'")),
-    }
-}
-
-fn ls_with_method(session: &ssh2::Session, command: &ListCommand, session_id: Option<&str>) -> Result<Value> {
-    match command.method.as_str() {
-        "sftp" => sftp_ls(session, &command.remote, session_id),
-        "scp" => exec_ls(session, &command.remote, session_id),
-        "auto" => sftp_ls(session, &command.remote, session_id).or_else(|error| {
-            if is_sftp_error(&error) {
-                exec_ls(session, &command.remote, session_id)
-            } else {
-                Err(error)
-            }
-        }),
-        other => Err(anyhow!("unsupported transfer method '{other}'")),
-    }
-}
-
-fn write_with_method(session: &ssh2::Session, command: &WriteCommand, session_id: Option<&str>) -> Result<Value> {
-    sftp_write(session, &command.remote, &command.content, session_id, command.append).or_else(|sftp_error| {
-        if !is_sftp_error(&sftp_error) {
-            return Err(sftp_error);
-        }
-        exec_write(session, &command.remote, &command.content, session_id, command.append)
-            .with_context(|| format!("write fallback exhausted after SFTP error: {sftp_error}"))
-    })
-}
-
-fn sftp_read(session: &ssh2::Session, remote: &Path, session_id: Option<&str>) -> Result<Value> {
-    let sftp = session
-        .sftp()
-        .context("SFTP is not available on this server. The SSH server may not have the sftp subsystem enabled.")?;
-    let mut file = sftp
-        .open(remote)
-        .with_context(|| format!("open remote file {}", remote.display()))?;
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
-    let stat = sftp.stat(remote).ok();
-    let mut result = serde_json::json!({
-        "remote": remote,
-        "content": content,
-        "bytes": content.len(),
-        "method": "sftp"
-    });
-    if let Some(stat) = stat {
-        result["stat"] = stat_json(stat);
-    }
-    if let Some(session_id) = session_id {
-        result["session_id"] = serde_json::json!(session_id);
-    }
-    Ok(result)
-}
-
-fn delete_with_fallback(session: &ssh2::Session, command: &DeleteFileCommand, session_id: Option<&str>) -> Result<Value> {
-    sftp_delete(session, &command.remote, command.recursive, session_id).or_else(|sftp_error| {
-        if !is_sftp_error(&sftp_error) {
-            return Err(sftp_error);
-        }
-        exec_delete(session, &command.remote, command.recursive, session_id)
-            .with_context(|| format!("delete fallback exhausted after SFTP error: {sftp_error}"))
-    })
-}
-
-fn sftp_delete(
-    session: &ssh2::Session,
-    remote: &Path,
-    recursive: bool,
-    session_id: Option<&str>,
+async fn do_upload(
+    handle: &connection::SharedConnectionHandle,
+    local: &str,
+    remote: &str,
+    method: &str,
 ) -> Result<Value> {
-    let sftp = session
-        .sftp()
-        .context("SFTP is not available on this server. The SSH server may not have the sftp subsystem enabled.")?;
-    let stat = sftp
-        .stat(remote)
-        .with_context(|| format!("stat remote path {}", remote.display()))?;
-    let deleted_type = if stat.is_dir() {
-        if recursive {
-            sftp_rmdir_recursive(&sftp, remote).with_context(|| format!("recursive remove {}", remote.display()))?;
-        } else {
-            sftp.rmdir(remote)
-                .with_context(|| format!("rmdir {} (use --recursive for non-empty directories)", remote.display()))?;
+    let local_path = crate::util::expand_home(Path::new(local));
+    let data = std::fs::read(&local_path)
+        .with_context(|| format!("reading {}", local))?;
+    let file_name = local_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+
+    match method {
+        "sftp" | "auto" => {
+            match sftp_write(handle, remote, &data).await {
+                Ok(v) => return Ok(v),
+                Err(e) if method == "auto" => {
+                    exec_upload(handle, remote, &data, &file_name).await
+                }
+                Err(e) => Err(e),
+            }
         }
-        "directory"
-    } else {
-        sftp.unlink(remote)
-            .with_context(|| format!("unlink {}", remote.display()))?;
-        "file"
-    };
-    let mut result = serde_json::json!({
-        "remote": remote,
-        "deleted": true,
-        "type": deleted_type,
-        "method": "sftp"
-    });
-    if let Some(session_id) = session_id {
-        result["session_id"] = serde_json::json!(session_id);
+        "exec" => exec_upload(handle, remote, &data, &file_name).await,
+        _ => bail!("unsupported upload method: {}", method),
     }
-    Ok(result)
 }
 
-fn sftp_rmdir_recursive(sftp: &ssh2::Sftp, path: &Path) -> Result<()> {
-    for (entry_path, stat) in sftp.readdir(path)? {
-        let full = path.join(&entry_path);
-        if stat.is_dir() {
-            sftp_rmdir_recursive(sftp, &full)?;
-        } else {
-            sftp.unlink(&full)?;
-        }
-    }
-    sftp.rmdir(path)?;
-    Ok(())
-}
-
-fn exec_delete(
-    session: &ssh2::Session,
-    remote: &Path,
-    recursive: bool,
-    session_id: Option<&str>,
+async fn do_download(
+    handle: &connection::SharedConnectionHandle,
+    local: &str,
+    remote: &str,
+    method: &str,
 ) -> Result<Value> {
-    session.set_blocking(true);
-    let remote_lossy = remote.to_string_lossy();
-    let remote_str = shell_words::quote(&remote_lossy);
-    let command = if recursive {
-        format!("rm -rf {}", remote_str)
-    } else {
-        format!("rm {}", remote_str)
-    };
-    let output = exec_remote_command(session, &command)
-        .with_context(|| format!("exec delete {}", remote.display()))?;
-    if !output.trim().is_empty() {
-        return Err(anyhow!("delete failed: {}", output.trim()));
+    match method {
+        "sftp" | "auto" => {
+            match sftp_read(handle, remote).await {
+                Ok(data) => {
+                    let local_path = crate::util::expand_home(Path::new(local));
+                    if let Some(parent) = local_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&local_path, &data)?;
+                    Ok(json!({"ok": true, "local": local, "remote": remote, "bytes": data.len(), "method": "sftp"}))
+                }
+                Err(e) if method == "auto" => exec_download(handle, local, remote).await,
+                Err(e) => Err(e),
+            }
+        }
+        "exec" => exec_download(handle, local, remote).await,
+        _ => bail!("unsupported download method: {}", method),
     }
-    let mut result = serde_json::json!({
-        "remote": remote,
-        "deleted": true,
-        "type": if recursive { "directory" } else { "path" },
-        "method": "exec"
-    });
-    if let Some(session_id) = session_id {
-        result["session_id"] = serde_json::json!(session_id);
-    }
-    Ok(result)
 }
 
-fn sftp_edit(
-    session: &ssh2::Session,
-    remote: &Path,
+async fn do_ls(
+    handle: &connection::SharedConnectionHandle,
+    remote: &str,
+    method: &str,
+) -> Result<Value> {
+    match method {
+        "sftp" | "auto" => {
+            match sftp_ls(handle, remote).await {
+                Ok(v) => Ok(v),
+                Err(e) if method == "auto" => exec_ls(handle, remote).await,
+                Err(e) => Err(e),
+            }
+        }
+        "exec" => exec_ls(handle, remote).await,
+        _ => bail!("unsupported ls method: {}", method),
+    }
+}
+
+async fn do_write(
+    handle: &connection::SharedConnectionHandle,
+    remote: &str,
+    content: &[u8],
+    _size: &usize,
+    method: &str,
+) -> Result<Value> {
+    match method {
+        "sftp" | "auto" => {
+            match sftp_write(handle, remote, content).await {
+                Ok(v) => Ok(v),
+                Err(e) if method == "auto" => {
+                    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, content);
+                    exec_write(handle, remote, &encoded).await
+                }
+                Err(e) => Err(e),
+            }
+        }
+        "exec" => {
+            let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, content);
+            exec_write(handle, remote, &encoded).await
+        }
+        _ => bail!("unsupported write method: {}", method),
+    }
+}
+
+async fn do_read_file(
+    handle: &connection::SharedConnectionHandle,
+    remote: &str,
+) -> Result<Value> {
+    let data = sftp_read(handle, remote).await?;
+    let content = String::from_utf8_lossy(&data).into_owned();
+    Ok(json!({"ok": true, "path": remote, "content": content, "bytes": data.len()}))
+}
+
+async fn do_delete(
+    handle: &connection::SharedConnectionHandle,
+    remote: &str,
+    _recursive: bool,
+) -> Result<Value> {
+    match sftp_delete(handle, remote).await {
+        Ok(v) => Ok(v),
+        Err(_) => exec_delete(handle, remote).await,
+    }
+}
+
+async fn do_edit(
+    handle: &connection::SharedConnectionHandle,
+    remote: &str,
     find: &str,
     replace: &str,
-    use_regex: bool,
-    session_id: Option<&str>,
 ) -> Result<Value> {
-    let sftp = session
-        .sftp()
-        .context("SFTP is not available on this server. The SSH server may not have the sftp subsystem enabled.")?;
-    let mut file = sftp
-        .open(remote)
-        .with_context(|| format!("open remote file {}", remote.display()))?;
-    let mut original = String::new();
-    file.read_to_string(&mut original)?;
-
-    let (modified, replacements) = if use_regex {
-        let re = regex::Regex::new(find)
-            .with_context(|| format!("invalid regex pattern '{find}'"))?;
-        let count = re.find_iter(&original).count();
-        let result = re.replace_all(&original, replace).into_owned();
-        (result, count)
-    } else {
-        let count = original.matches(find).count();
-        (original.replace(find, replace), count)
-    };
-
-    if replacements == 0 {
-        return Err(anyhow!("pattern not found in {}", remote.display()));
-    }
-
-    sftp.create(remote)
-        .with_context(|| format!("create remote file {}", remote.display()))?
-        .write_all(modified.as_bytes())?;
-
-    let mut result = serde_json::json!({
-        "remote": remote,
-        "replacements": replacements,
-        "method": "sftp"
-    });
-    if let Some(session_id) = session_id {
-        result["session_id"] = serde_json::json!(session_id);
-    }
-    Ok(result)
+    let data = sftp_read(handle, remote).await?;
+    let content = String::from_utf8_lossy(&data).into_owned();
+    let edited = content.replace(find, replace);
+    sftp_write(handle, remote, edited.as_bytes()).await?;
+    Ok(json!({"ok": true, "path": remote, "size": edited.len()}))
 }
 
-fn sftp_upload(session: &ssh2::Session, local: &Path, remote: &Path, session_id: Option<&str>) -> Result<Value> {
-    let sftp = session
-        .sftp()
-        .context("SFTP is not available on this server. The SSH server may not have the sftp subsystem enabled.")?;
-    sftp.create(remote)
-        .with_context(|| format!("create remote file {}", remote.display()))?
-        .write_all(&fs::read(local).with_context(|| format!("read local file {}", local.display()))?)?;
-    Ok(transfer_result_json(local, remote, "sftp", session_id))
+// ---------------------------------------------------------------------------
+// SFTP via russh-sftp
+// ---------------------------------------------------------------------------
+
+async fn open_sftp(
+    handle: &connection::SharedConnectionHandle,
+) -> Result<russh_sftp::client::SftpSession> {
+    let channel = handle
+        .channel_open_session()
+        .await
+        .context("opening SFTP channel")?;
+
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .context("requesting SFTP subsystem")?;
+
+    let sftp = russh_sftp::client::SftpSession::new(channel.into_stream())
+        .await
+        .context("initializing SFTP session")?;
+
+    Ok(sftp)
 }
 
-fn scp_upload(session: &ssh2::Session, local: &Path, remote: &Path, session_id: Option<&str>) -> Result<Value> {
-    let data = fs::read(local).with_context(|| format!("read local file {}", local.display()))?;
-    let size = data.len() as u64;
-    let mut channel = session
-        .scp_send(remote, 0o644, size, None)
-        .with_context(|| format!("scp send remote file {}", remote.display()))?;
-    channel.write_all(&data)?;
-    channel.send_eof()?;
-    channel.wait_eof()?;
-    channel.wait_close()?;
-    Ok(transfer_result_json(local, remote, "scp", session_id))
-}
+async fn sftp_write(
+    handle: &connection::SharedConnectionHandle,
+    remote: &str,
+    data: &[u8],
+) -> Result<Value> {
+    let sftp = open_sftp(handle).await?;
 
-fn exec_upload(session: &ssh2::Session, local: &Path, remote: &Path, session_id: Option<&str>) -> Result<Value> {
-    session.set_blocking(true);
-    let data = fs::read(local).with_context(|| format!("read local file {}", local.display()))?;
-    let encoded = B64.encode(data);
-    let command = build_exec_upload_command(remote, &encoded)?;
-    exec_powershell(session, &command).with_context(|| format!("exec upload remote file {}", remote.display()))?;
-    Ok(transfer_result_json(local, remote, "exec", session_id))
-}
-
-fn sftp_write(session: &ssh2::Session, remote: &Path, content: &str, session_id: Option<&str>, append: bool) -> Result<Value> {
-    let sftp = session
-        .sftp()
-        .context("SFTP is not available on this server. The SSH server may not have the sftp subsystem enabled.")?;
-    if append {
-        sftp.open_mode(
-            remote,
-            ssh2::OpenFlags::WRITE | ssh2::OpenFlags::APPEND | ssh2::OpenFlags::CREATE,
-            0o644,
-            ssh2::OpenType::File,
-        )
-        .with_context(|| format!("open remote file {} for append", remote.display()))?
-        .write_all(content.as_bytes())?;
-    } else {
-        sftp.create(remote)
-            .with_context(|| format!("create remote file {}", remote.display()))?
-            .write_all(content.as_bytes())?;
-    }
-    Ok(write_result_json(remote, content.len(), "sftp", session_id))
-}
-
-fn exec_write(session: &ssh2::Session, remote: &Path, content: &str, session_id: Option<&str>, append: bool) -> Result<Value> {
-    session.set_blocking(true);
-    let encoded = B64.encode(content.as_bytes());
-    if encoded.len() >= EXEC_UPLOAD_BASE64_LIMIT {
-        return Err(anyhow!(
-            "exec write payload too large: base64 length {} exceeds limit {}",
-            encoded.len(),
-            EXEC_UPLOAD_BASE64_LIMIT
-        ));
-    }
-    let command = build_exec_write_command(remote, &encoded, append)?;
-    exec_powershell(session, &command)
-        .with_context(|| format!("exec write remote file {}", remote.display()))?;
-    Ok(write_result_json(remote, content.len(), "exec", session_id))
-}
-
-fn sftp_download(session: &ssh2::Session, remote: &Path, local: &Path, session_id: Option<&str>) -> Result<Value> {
-    let sftp = session
-        .sftp()
-        .context("SFTP is not available on this server. The SSH server may not have the sftp subsystem enabled.")?;
-    let mut remote_file = sftp
-        .open(remote)
-        .with_context(|| format!("open remote file {}", remote.display()))?;
-    let mut data = Vec::new();
-    remote_file.read_to_end(&mut data)?;
-    write_local_file(local, &data)?;
-    Ok(download_result_json(remote, local, "sftp", session_id))
-}
-
-fn scp_download(session: &ssh2::Session, remote: &Path, local: &Path, session_id: Option<&str>) -> Result<Value> {
-    let (mut channel, _stat) = session
-        .scp_recv(remote)
-        .with_context(|| format!("scp recv remote file {}", remote.display()))?;
-    let mut data = Vec::new();
-    channel.read_to_end(&mut data)?;
-    channel.send_eof()?;
-    channel.wait_eof()?;
-    channel.wait_close()?;
-    write_local_file(local, &data)?;
-    Ok(download_result_json(remote, local, "scp", session_id))
-}
-
-fn exec_download(session: &ssh2::Session, remote: &Path, local: &Path, session_id: Option<&str>) -> Result<Value> {
-    session.set_blocking(true);
-    let command = build_exec_download_command(remote);
-    let output = exec_powershell(session, &command)
-        .with_context(|| format!("exec download remote file {}", remote.display()))?;
-    let data = decode_exec_download_output(&output)?;
-    write_local_file(local, &data)?;
-    Ok(download_result_json(remote, local, "exec", session_id))
-}
-
-fn sftp_ls(session: &ssh2::Session, remote: &Path, session_id: Option<&str>) -> Result<Value> {
-    let sftp = session
-        .sftp()
-        .context("SFTP is not available on this server. The SSH server may not have the sftp subsystem enabled.")?;
-    let entries = sftp
-        .readdir(remote)
-        .with_context(|| format!("read remote directory {}", remote.display()))?;
-    let mut result = serde_json::json!({
-        "remote": remote,
-        "entries": entries
-            .into_iter()
-            .map(|(path, stat)| serde_json::json!({ "path": path, "stat": stat_json(stat) }))
-            .collect::<Vec<_>>(),
-        "method": "sftp"
-    });
-    if let Some(session_id) = session_id {
-        result["session_id"] = serde_json::json!(session_id);
-    }
-    Ok(result)
-}
-
-fn exec_ls(session: &ssh2::Session, remote: &Path, session_id: Option<&str>) -> Result<Value> {
-    let command = format!("ls -la {}", shell_words::quote(&remote.to_string_lossy()));
-    let output = exec_remote_command(session, &command).context("remote ls command failed")?;
-    let lines = output.lines().map(str::to_owned).collect::<Vec<_>>();
-    let mut result = serde_json::json!({
-        "remote": remote,
-        "output": lines,
-        "method": "exec"
-    });
-    if let Some(session_id) = session_id {
-        result["session_id"] = serde_json::json!(session_id);
-    }
-    Ok(result)
-}
-
-fn build_exec_upload_command(remote: &Path, encoded: &str) -> Result<String> {
-    if encoded.len() >= EXEC_UPLOAD_BASE64_LIMIT {
-        return Err(anyhow!(
-            "exec upload payload too large: base64 length {} exceeds limit {}",
-            encoded.len(),
-            EXEC_UPLOAD_BASE64_LIMIT
-        ));
-    }
-
-    Ok(format!(
-        "[IO.File]::WriteAllBytes({}, [Convert]::FromBase64String('{}'))",
-        powershell_single_quote(remote),
-        encoded
-    ))
-}
-
-fn build_exec_write_command(remote: &Path, encoded: &str, append: bool) -> Result<String> {
-    if encoded.len() >= EXEC_UPLOAD_BASE64_LIMIT {
-        return Err(anyhow!(
-            "exec write payload too large: base64 length {} exceeds limit {}",
-            encoded.len(),
-            EXEC_UPLOAD_BASE64_LIMIT
-        ));
-    }
-
-    if append {
-        Ok(format!(
-            "$b=[Convert]::FromBase64String('{encoded}');$f=[IO.File]::Open({},[IO.FileMode]::Append);$f.Write($b,0,$b.Length);$f.Close()",
-            powershell_single_quote(remote)
-        ))
-    } else {
-        Ok(format!(
-            "[IO.File]::WriteAllBytes({}, [Convert]::FromBase64String('{encoded}'))",
-            powershell_single_quote(remote)
-        ))
-    }
-}
-
-fn build_exec_download_command(remote: &Path) -> String {
-    format!(
-        "[Convert]::ToBase64String([IO.File]::ReadAllBytes({}))",
-        powershell_single_quote(remote)
-    )
-}
-
-fn decode_exec_download_output(output: &str) -> Result<Vec<u8>> {
-    let trimmed = output.trim();
-    B64.decode(trimmed)
-        .with_context(|| format!("decode base64 download payload from {} chars of output", trimmed.len()))
-}
-
-fn powershell_single_quote(path: &Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', "''"))
-}
-
-fn exec_powershell(session: &ssh2::Session, script: &str) -> Result<String> {
-    let escaped = script.replace('"', "\"\"");
-    let command = format!("powershell -Command \"{escaped}\"");
-    exec_remote_command(session, &command)
-}
-
-fn exec_remote_command(session: &ssh2::Session, command: &str) -> Result<String> {
-    session.set_blocking(true);
-    let mut channel = session.channel_session()?;
-    channel.exec(command)?;
-    let mut output = String::new();
-    channel.read_to_string(&mut output)?;
-    let mut stderr = String::new();
-    channel.stderr().read_to_string(&mut stderr)?;
-    channel.wait_close()?;
-    let exit_status = channel.exit_status()?;
-    if exit_status != 0 {
-        let detail = stderr.trim();
-        if detail.is_empty() {
-            return Err(anyhow!("remote command failed with exit status {exit_status}"));
+    if let Some(parent) = Path::new(remote).parent() {
+        let parent_str = parent.to_string_lossy();
+        if !parent_str.is_empty() && parent_str != "/" {
+            let _ = sftp.create_dir(parent_str.to_string()).await;
         }
-        return Err(anyhow!("remote command failed with exit status {exit_status}: {detail}"));
     }
-    Ok(output)
+
+    use russh_sftp::protocol::OpenFlags;
+    let mut file = sftp
+        .open_with_flags(
+            remote,
+            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+        )
+        .await
+        .with_context(|| format!("opening remote file for write: {}", remote))?;
+
+    file.write_all(data).await?;
+    file.shutdown().await?;
+
+    Ok(json!({"ok": true, "remote": remote, "bytes": data.len(), "method": "sftp"}))
 }
 
-fn transfer_result_json(local: &Path, remote: &Path, method: &str, session_id: Option<&str>) -> Value {
-    let mut result = serde_json::json!({
-        "local": local,
-        "remote": remote,
-        "method": method
-    });
-    if let Some(session_id) = session_id {
-        result["session_id"] = serde_json::json!(session_id);
-    }
-    result
+async fn sftp_read(
+    handle: &connection::SharedConnectionHandle,
+    remote: &str,
+) -> Result<Vec<u8>> {
+    let sftp = open_sftp(handle).await?;
+    let data = sftp.read(remote).await?;
+    Ok(data)
 }
 
-fn write_result_json(remote: &Path, bytes: usize, method: &str, session_id: Option<&str>) -> Value {
-    let mut result = serde_json::json!({
-        "remote": remote,
-        "bytes": bytes,
-        "method": method
-    });
-    if let Some(session_id) = session_id {
-        result["session_id"] = serde_json::json!(session_id);
-    }
-    result
+async fn sftp_ls(
+    handle: &connection::SharedConnectionHandle,
+    remote: &str,
+) -> Result<Value> {
+    let sftp = open_sftp(handle).await?;
+    let entries = sftp.read_dir(remote).await?;
+
+    let items: Vec<Value> = entries
+        .map(|entry| {
+            let metadata = entry.metadata();
+            json!({
+                "name": entry.file_name(),
+                "path": entry.path(),
+                "is_dir": metadata.is_dir(),
+                "size": metadata.len(),
+                "modified": metadata.mtime.map(|t| t.to_string()).unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    Ok(json!({"ok": true, "path": remote, "entries": items, "method": "sftp"}))
 }
 
-fn download_result_json(remote: &Path, local: &Path, method: &str, session_id: Option<&str>) -> Value {
-    let mut result = serde_json::json!({
-        "remote": remote,
-        "local": local,
-        "method": method
-    });
-    if let Some(session_id) = session_id {
-        result["session_id"] = serde_json::json!(session_id);
+async fn sftp_delete(
+    handle: &connection::SharedConnectionHandle,
+    remote: &str,
+) -> Result<Value> {
+    let sftp = open_sftp(handle).await?;
+    match sftp.remove_file(remote).await {
+        Ok(()) => Ok(json!({"ok": true, "deleted": remote, "method": "sftp"})),
+        Err(_) => {
+            sftp.remove_dir(remote).await?;
+            Ok(json!({"ok": true, "deleted": remote, "method": "sftp"}))
+        }
     }
-    result
 }
 
-fn write_local_file(local: &Path, data: &[u8]) -> Result<()> {
-    if let Some(parent) = local.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(local, data).with_context(|| format!("write local file {}", local.display()))
+// ---------------------------------------------------------------------------
+// Exec-based fallback
+// ---------------------------------------------------------------------------
+
+async fn exec_remote_command(
+    handle: &connection::SharedConnectionHandle,
+    cmd: &str,
+) -> Result<(String, String, i32)> {
+    let mut channel = handle
+        .channel_open_session()
+        .await
+        .context("opening exec channel")?;
+    connection::exec_channel(&mut channel, cmd, None).await
 }
 
-fn is_sftp_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
-    message.contains("SFTP") || message.contains("sftp")
+async fn exec_upload(
+    handle: &connection::SharedConnectionHandle,
+    remote: &str,
+    data: &[u8],
+    _file_name: &str,
+) -> Result<Value> {
+    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
+    let chunk_size = 30000;
+    if encoded.len() <= chunk_size {
+        let cmd = format!("echo '{}' | base64 -d > '{}'", encoded, remote);
+        let (_, stderr, exit_code) = exec_remote_command(handle, &cmd).await?;
+        if exit_code != 0 {
+            bail!("exec upload failed: {}", stderr);
+        }
+    } else {
+        let first = &encoded[..chunk_size];
+        let cmd = format!("echo '{}' | base64 -d > '{}'", first, remote);
+        let (_, stderr, exit_code) = exec_remote_command(handle, &cmd).await?;
+        if exit_code != 0 { bail!("exec upload failed: {}", stderr); }
+
+        let mut pos = chunk_size;
+        while pos < encoded.len() {
+            let end = (pos + chunk_size).min(encoded.len());
+            let chunk = &encoded[pos..end];
+            let cmd = format!("echo '{}' | base64 -d >> '{}'", chunk, remote);
+            let (_, stderr, exit_code) = exec_remote_command(handle, &cmd).await?;
+            if exit_code != 0 { bail!("exec upload chunk failed: {}", stderr); }
+            pos = end;
+        }
+    }
+    Ok(json!({"ok": true, "remote": remote, "bytes": data.len(), "method": "exec"}))
 }
+
+async fn exec_download(
+    handle: &connection::SharedConnectionHandle,
+    local: &str,
+    remote: &str,
+) -> Result<Value> {
+    let cmd = format!("base64 '{}'", remote);
+    let (stdout, stderr, exit_code) = exec_remote_command(handle, &cmd).await?;
+    if exit_code != 0 { bail!("exec download failed: {}", stderr); }
+
+    let data = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, stdout.trim())?;
+    let local_path = crate::util::expand_home(Path::new(local));
+    if let Some(parent) = local_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&local_path, &data)?;
+    Ok(json!({"ok": true, "local": local, "remote": remote, "bytes": data.len(), "method": "exec"}))
+}
+
+async fn exec_ls(
+    handle: &connection::SharedConnectionHandle,
+    remote: &str,
+) -> Result<Value> {
+    let cmd = format!("ls -la '{}'", remote);
+    let (stdout, stderr, exit_code) = exec_remote_command(handle, &cmd).await?;
+    if exit_code != 0 { bail!("exec ls failed: {}", stderr); }
+
+    let entries: Vec<Value> = stdout
+        .lines()
+        .skip(1)
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| parse_ls_line(line))
+        .collect();
+
+    Ok(json!({"ok": true, "path": remote, "entries": entries, "method": "exec"}))
+}
+
+async fn exec_write(
+    handle: &connection::SharedConnectionHandle,
+    remote: &str,
+    base64_content: &str,
+) -> Result<Value> {
+    let cmd = format!("echo '{}' | base64 -d > '{}'", base64_content, remote);
+    let (_, stderr, exit_code) = exec_remote_command(handle, &cmd).await?;
+    if exit_code != 0 { bail!("exec write failed: {}", stderr); }
+    Ok(json!({"ok": true, "path": remote, "method": "exec"}))
+}
+
+async fn exec_delete(
+    handle: &connection::SharedConnectionHandle,
+    remote: &str,
+) -> Result<Value> {
+    let cmd = format!("rm -rf '{}'", remote);
+    let (_, stderr, exit_code) = exec_remote_command(handle, &cmd).await?;
+    if exit_code != 0 { bail!("exec delete failed: {}", stderr); }
+    Ok(json!({"ok": true, "deleted": remote, "method": "exec"}))
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn get_handle(
+    session_id: Option<&str>,
+    state: &ServerState,
+) -> Result<std::sync::Arc<connection::SharedConnectionHandle>> {
+    let sid = session_id.ok_or_else(|| anyhow::anyhow!("session-id required for daemon file operations"))?;
+    let session = state
+        .sessions
+        .get(sid)
+        .ok_or_else(|| anyhow::anyhow!("session {} not found", sid))?;
+    let conn = state
+        .connections
+        .get(&session.connection_id)
+        .ok_or_else(|| anyhow::anyhow!("connection {} not found", session.connection_id))?;
+    Ok(conn.handle.clone())
+}
+
+fn parse_ls_line(line: &str) -> Option<Value> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 9 { return None; }
+    let perms = parts[0];
+    let size: u64 = parts[4].parse().ok()?;
+    let name = parts[8..].join(" ");
+    let is_dir = perms.starts_with('d');
+    Some(json!({"name": name, "permissions": perms, "size": size, "is_dir": is_dir}))
+}
+
+/// Resolve ConnectArgs by merging with profile if --profile is specified.
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn build_exec_upload_command_uses_single_quoted_path() {
-        let command = build_exec_upload_command(Path::new(r"C:\temp\o'hare.txt"), "QUJD")
-            .expect("command should build");
-
-        assert_eq!(
-            command,
-            r"[IO.File]::WriteAllBytes('C:\temp\o''hare.txt', [Convert]::FromBase64String('QUJD'))"
-        );
+    fn test_parse_ls_line() {
+        let line = "-rw-r--r-- 1 root root 1234 Jan 01 12:00 test.txt";
+        let entry = parse_ls_line(line).unwrap();
+        assert_eq!(entry["name"], "test.txt");
+        assert_eq!(entry["size"], 1234);
+        assert_eq!(entry["is_dir"], false);
     }
 
     #[test]
-    fn build_exec_upload_command_rejects_large_base64_payloads() {
-        let payload = "A".repeat(30_000);
-        let error = build_exec_upload_command(Path::new("C:/temp/file.txt"), &payload)
-            .expect_err("payload should be rejected");
-
-        assert!(error.to_string().contains("too large"));
+    fn test_parse_ls_line_directory() {
+        let line = "drwxr-xr-x 2 root root 4096 Jan 01 12:00 mydir";
+        let entry = parse_ls_line(line).unwrap();
+        assert_eq!(entry["name"], "mydir");
+        assert_eq!(entry["is_dir"], true);
     }
 
     #[test]
-    fn build_exec_download_command_uses_single_quoted_path() {
-        let command = build_exec_download_command(Path::new(r"C:\temp\o'hare.txt"));
-
-        assert_eq!(
-            command,
-            r"[Convert]::ToBase64String([IO.File]::ReadAllBytes('C:\temp\o''hare.txt'))"
-        );
-    }
-
-    #[test]
-    fn decode_exec_download_output_trims_trailing_whitespace() {
-        let data = decode_exec_download_output("SGVsbG8=\r\n").expect("base64 should decode");
-
-        assert_eq!(data, b"Hello");
+    fn test_base64_roundtrip() {
+        let data = b"hello world";
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
+        let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encoded).unwrap();
+        assert_eq!(decoded, data);
     }
 }
