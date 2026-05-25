@@ -1,6 +1,6 @@
 [package]
 name = "agentssh"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 description = "AI-native SSH toolkit — programmable JSON-speaking SSH/SFTP backend for AI agents"
 license = "MIT"
@@ -17,6 +17,9 @@ rpassword = "7.4.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 shell-words = "1.1.0"
-ssh2 = "0.9.5"
 regex = "1.11.1"
 base64 = "0.22"
+russh = "0.61"
+russh-sftp = "2.3"
+tokio = { version = "1", features = ["full"] }
+bytes = "1"

@@ -1,263 +1,653 @@
-use crate::cli::{ConnectArgs, ConnectCommand, ReadCommand, ResizeCommand, SessionExecCommand, SessionInputCommand, SignalCommand, SpawnCommand};
-use crate::connection::{SessionIdentity, SharedConnection, connect_with_info, exec_channel, get_connection_mut, next_connection_id};
-use crate::interactive::output_matches;
-use crate::kernel::ServerState;
-use crate::util::{MAX_BUFFER, log_daemon, now_ms, sleep_ms, strip_ansi};
-use anyhow::{Result, anyhow, bail};
-use serde_json::Value;
-use ssh2::Channel;
-use std::io::{Read, Write};
+use crate::cli::{ConnectArgs, ConnectCommand, ExpectRespondPair, SpawnCommand};
+use crate::connection::{self, SharedConnection, SharedConnectionHandle};
+use crate::util::{self, now_ms, strip_ansi};
+use anyhow::{Context, Result, bail};
+use russh::{client, Channel, ChannelMsg};
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::mpsc;
 
-const DEFAULT_WAIT_FOR_EXIT_TIMEOUT_MS: u64 = 60_000;
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
-pub struct RemoteSession {
-    pub id: String,
-    pub connection_id: String,
-    pub shell: Channel,
-    pub(crate) host: String,
-    pub(crate) port: u16,
-    pub(crate) username: String,
-    pub(crate) output: Vec<u8>,
-    pub(crate) cursor: usize,
-    pub(crate) created_at: u128,
-    pub(crate) updated_at: u128,
-    pub(crate) status: String,
-    pub(crate) cols: u32,
-    pub(crate) rows: u32,
-    pub(crate) exit_status: Option<i32>,
-    pub(crate) exit_signal: Option<String>,
-    pub(crate) connect_args: ConnectArgs,
-    pub(crate) reconnect: bool,
+const MAX_BUFFER: usize = 1024 * 1024; // 1 MB
+
+// ---------------------------------------------------------------------------
+// Commands sent to the drain task via mpsc
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub enum SessionCmd {
+    Send { data: Vec<u8> },
+    Resize { cols: u32, rows: u32 },
+    Signal { signal: String },
+    Close,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SessionMetadataForTesting {
-    pub id: String,
-    pub connection_id: String,
+// ---------------------------------------------------------------------------
+// Output buffer shared between drain task and daemon
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+pub struct OutputBuffer {
+    pub data: Vec<u8>,
+    pub cursor: usize,
 }
 
-pub fn create_session(
-    state: &mut ServerState,
-    connection_id: &str,
-    identity: SessionIdentity,
+impl OutputBuffer {
+    fn extend(&mut self, new_data: &[u8]) {
+        self.data.extend_from_slice(new_data);
+        if self.data.len() > MAX_BUFFER {
+            let excess = self.data.len() - MAX_BUFFER;
+            self.data.drain(..excess);
+            self.cursor = self.cursor.saturating_sub(excess);
+        }
+    }
+
+    fn page(&self, offset: usize, limit: usize, do_strip: bool) -> (String, usize, usize) {
+        let start = offset.max(self.cursor);
+        if start >= self.data.len() {
+            return (String::new(), start, self.data.len());
+        }
+        let end = (start + limit).min(self.data.len());
+        let raw = &self.data[start..end];
+        let text = if do_strip {
+            strip_ansi(&String::from_utf8_lossy(raw))
+        } else {
+            String::from_utf8_lossy(raw).into_owned()
+        };
+        (text, end, self.data.len())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SessionHandle — the daemon's view of a session
+// ---------------------------------------------------------------------------
+
+pub struct SessionHandle {
+    pub id: String,
+    pub connection_id: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub cols: u32,
+    pub rows: u32,
+    pub reconnect: bool,
+    pub connect_args: ConnectArgs,
+    pub created_at: u64,
+    pub updated_at: Arc<Mutex<u64>>,
+
+    // Shared state with drain task
+    pub output: Arc<Mutex<OutputBuffer>>,
+    pub status: Arc<Mutex<String>>,
+    pub exit_status: Arc<Mutex<Option<i32>>>,
+    pub exit_signal: Arc<Mutex<Option<String>>>,
+
+    // Command channel to drain task
+    pub cmd_tx: mpsc::UnboundedSender<SessionCmd>,
+
+    // Set to true when drain task has exited
+    pub drain_dead: Arc<Mutex<bool>>,
+}
+
+impl SessionHandle {
+    pub fn page_output(&self, offset: usize, limit: usize, do_strip: bool) -> Value {
+        let buf = self.output.lock().unwrap();
+        let (text, next_offset, total) = buf.page(offset, limit, do_strip);
+        json!({"text": text, "offset": next_offset, "total": total})
+    }
+
+    pub fn summary(&self, all_sessions: &BTreeMap<String, SessionHandle>) -> Value {
+        let buf = self.output.lock().unwrap();
+        let status = self.status.lock().unwrap();
+        let exit_status = self.exit_status.lock().unwrap();
+        let exit_signal = self.exit_signal.lock().unwrap();
+
+        json!({
+            "id": self.id,
+            "connection_id": self.connection_id,
+            "host": self.host,
+            "port": self.port,
+            "username": self.username,
+            "status": *status,
+            "output_size": buf.data.len(),
+            "exit_status": *exit_status,
+            "exit_signal": exit_signal.as_deref().unwrap_or(""),
+            "reconnect": self.reconnect,
+            "cols": self.cols,
+            "rows": self.rows,
+            "siblings": shared_with_ids(&self.id, &self.connection_id, all_sessions),
+            "created_at": self.created_at,
+            "updated_at": *self.updated_at.lock().unwrap(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Drain task — owns the Channel, continuously reads PTY output
+// ---------------------------------------------------------------------------
+
+pub async fn spawn_drain_task(
+    channel: Channel<client::Msg>,
+    output: Arc<Mutex<OutputBuffer>>,
+    status: Arc<Mutex<String>>,
+    exit_status: Arc<Mutex<Option<i32>>>,
+    exit_signal: Arc<Mutex<Option<String>>>,
+    drain_dead: Arc<Mutex<bool>>,
+    updated_at: Arc<Mutex<u64>>,
+) -> mpsc::UnboundedSender<SessionCmd> {
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+
+    tokio::spawn(async move {
+        *status.lock().unwrap() = "running".to_string();
+        let mut channel = channel;
+
+        loop {
+            tokio::select! {
+                msg = channel.wait() => {
+                    match msg {
+                        Some(ChannelMsg::Data { data }) => {
+                            output.lock().unwrap().extend(&data);
+                            *updated_at.lock().unwrap() = now_ms();
+                        }
+                        Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                            output.lock().unwrap().extend(&data);
+                            *updated_at.lock().unwrap() = now_ms();
+                        }
+                        Some(ChannelMsg::ExitStatus { exit_status: code }) => {
+                            *exit_status.lock().unwrap() = Some(code as i32);
+                            *status.lock().unwrap() = "exited".to_string();
+                            *updated_at.lock().unwrap() = now_ms();
+                        }
+                        Some(ChannelMsg::ExitSignal { signal_name, error_message, .. }) => {
+                            let sig_str = match &signal_name {
+                                russh::Sig::ABRT => "ABRT",
+                                russh::Sig::ALRM => "ALRM",
+                                russh::Sig::FPE => "FPE",
+                                russh::Sig::HUP => "HUP",
+                                russh::Sig::ILL => "ILL",
+                                russh::Sig::INT => "INT",
+                                russh::Sig::KILL => "KILL",
+                                russh::Sig::PIPE => "PIPE",
+                                russh::Sig::QUIT => "QUIT",
+                                russh::Sig::SEGV => "SEGV",
+                                russh::Sig::TERM => "TERM",
+                                russh::Sig::USR1 => "USR1",
+                                russh::Sig::Custom(s) => s,
+                            };
+                            *exit_signal.lock().unwrap() = Some(sig_str.to_string());
+                            *status.lock().unwrap() = "exited".to_string();
+                            if !error_message.is_empty() {
+                                let msg = format!("\r\n[signal: {}]\r\n", error_message);
+                                output.lock().unwrap().extend(msg.as_bytes());
+                            }
+                            *updated_at.lock().unwrap() = now_ms();
+                        }
+                        Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => {
+                            let current = status.lock().unwrap().clone();
+                            if current != "exited" {
+                                *status.lock().unwrap() = "closed".to_string();
+                            }
+                            *updated_at.lock().unwrap() = now_ms();
+                            break;
+                        }
+                        None => {
+                            let current = status.lock().unwrap().clone();
+                            if current == "running" {
+                                *status.lock().unwrap() = "closed".to_string();
+                            }
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        Some(SessionCmd::Send { data }) => {
+                            if let Err(e) = channel.data(&data[..]).await {
+                                *status.lock().unwrap() = format!("error: {}", e);
+                                break;
+                            }
+                        }
+                        Some(SessionCmd::Resize { cols, rows }) => {
+                            let _ = channel.window_change(cols, rows, 0, 0).await;
+                        }
+                        Some(SessionCmd::Signal { signal }) => {
+                            match signal.as_str() {
+                                "INT" => { let _ = channel.data(&b"\x03"[..]).await; }
+                                "QUIT" => { let _ = channel.data(&b"\x1c"[..]).await; }
+                                "TSTP" => { let _ = channel.data(&b"\x1a"[..]).await; }
+                                "TERM" | "KILL" => {
+                                    let _ = channel.eof().await;
+                                    *status.lock().unwrap() = "closed".to_string();
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        Some(SessionCmd::Close) => {
+                            let _ = channel.eof().await;
+                            *status.lock().unwrap() = "closed".to_string();
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        *drain_dead.lock().unwrap() = true;
+    });
+
+    cmd_tx
+}
+
+// ---------------------------------------------------------------------------
+// Open a PTY session
+// ---------------------------------------------------------------------------
+
+pub async fn open_pty(
+    handle: &SharedConnectionHandle,
     cols: u32,
     rows: u32,
-    wait_ms: u64,
-    limit: usize,
-    connect_args: ConnectArgs,
-    reconnect: bool,
+) -> Result<Channel<client::Msg>> {
+    let channel = handle
+        .channel_open_session()
+        .await
+        .context("opening session channel")?;
+
+    channel
+        .request_pty(true, "xterm-256color", cols, rows, 0, 0, &[])
+        .await
+        .context("requesting PTY")?;
+
+    channel
+        .request_shell(true)
+        .await
+        .context("requesting shell")?;
+
+    Ok(channel)
+}
+
+// ---------------------------------------------------------------------------
+// Daemon session operations
+// ---------------------------------------------------------------------------
+
+pub async fn daemon_connect(
+    cmd: &ConnectCommand,
+    state: &mut crate::kernel::ServerState,
 ) -> Result<Value> {
-    let shell = {
-        let connection = get_connection_mut(state, connection_id)?;
-        connection.ssh.set_blocking(true);
-        let mut shell = connection.ssh.channel_session()?;
-        shell.request_pty("xterm-256color", None, Some((cols, rows, 0, 0)))?;
-        shell.shell()?;
-        connection.ssh.set_blocking(false);
-        connection.refcount += 1;
-        shell
+    let resolved = connection::resolve_connect_args(&cmd.connect)?;
+    let (handle, host, port, username) = connection::connect_with_info(&resolved).await?;
+
+    let channel = open_pty(&handle, cmd.cols, cmd.rows).await?;
+
+    let connection_id = {
+        let entry = state.next_connection_id;
+        state.next_connection_id += 1;
+        format!("c{}", entry)
     };
 
-    state.next_id += 1;
-    let id = format!("s{}", state.next_id);
-    let created_at = now_ms();
-    let mut session = RemoteSession {
-        id: id.clone(),
-        connection_id: connection_id.to_string(),
-        shell,
-        host: identity.host,
-        port: identity.port,
-        username: identity.username,
-        output: Vec::new(),
-        cursor: 0,
-        created_at,
-        updated_at: created_at,
-        status: "running".to_string(),
-        cols,
-        rows,
-        exit_status: None,
-        exit_signal: None,
-        connect_args,
-        reconnect,
-    };
-
-    sleep_ms(wait_ms);
-    refresh_session_state(&mut session);
-    let page = page_output(&mut session, None, limit, true);
-    state.sessions.insert(id.clone(), session);
-    let all_sessions = state.sessions.values().map(session_metadata).collect::<Vec<_>>();
-    let summary = session_summary(
-        state.sessions.get(&id).expect("new session should be available"),
-        &all_sessions,
+    state.connections.insert(
+        connection_id.clone(),
+        SharedConnection {
+            handle: handle.clone(),
+            refcount: 1,
+        },
     );
-    Ok(serde_json::json!({
-        "session_id": id,
-        "session": summary,
-        "output": page,
-        "host": state.sessions.get(&id).expect("new session should be available").host.clone(),
-        "port": state.sessions.get(&id).expect("new session should be available").port
-    }))
+
+    let session_id = {
+        let entry = state.next_id;
+        state.next_id += 1;
+        format!("s{}", entry)
+    };
+
+    let output = Arc::new(Mutex::new(OutputBuffer::default()));
+    let status = Arc::new(Mutex::new("running".to_string()));
+    let exit_status = Arc::new(Mutex::new(None));
+    let exit_signal = Arc::new(Mutex::new(None));
+    let drain_dead = Arc::new(Mutex::new(false));
+    let updated_at = Arc::new(Mutex::new(now_ms()));
+
+    let cmd_tx = spawn_drain_task(
+        channel,
+        output.clone(),
+        status.clone(),
+        exit_status.clone(),
+        exit_signal.clone(),
+        drain_dead.clone(),
+        updated_at.clone(),
+    )
+    .await;
+
+    let session = SessionHandle {
+        id: session_id.clone(),
+        connection_id: connection_id.clone(),
+        host,
+        port,
+        username,
+        cols: cmd.cols,
+        rows: cmd.rows,
+        reconnect: cmd.reconnect,
+        connect_args: resolved,
+        created_at: now_ms(),
+        updated_at,
+        output,
+        status,
+        exit_status,
+        exit_signal,
+        cmd_tx,
+        drain_dead,
+    };
+
+    let summary = session.summary(&BTreeMap::new());
+    state.sessions.insert(session_id.clone(), session);
+
+    Ok(json!({"ok": true, "session_id": session_id, "connection_id": connection_id, "session": summary}))
 }
 
-pub fn ensure_session_connected(session: &RemoteSession) -> Result<()> {
-    if session.status == "running" {
-        return Ok(());
-    }
-    bail!("session '{}' is {}", session.id, session.status)
+pub async fn daemon_spawn(
+    cmd: &SpawnCommand,
+    state: &mut crate::kernel::ServerState,
+) -> Result<Value> {
+    let source = state
+        .sessions
+        .get(&cmd.from)
+        .ok_or_else(|| anyhow::anyhow!("session {} not found", cmd.from))?;
+
+    let connection_id = source.connection_id.clone();
+    let host = source.host.clone();
+    let port = source.port;
+    let username = source.username.clone();
+    let connect_args = source.connect_args.clone();
+
+    let conn = state
+        .connections
+        .get_mut(&connection_id)
+        .ok_or_else(|| anyhow::anyhow!("connection {} not found", connection_id))?;
+
+    let c = cmd.cols;
+    let r = cmd.rows;
+    let channel = open_pty(&conn.handle, c, r).await?;
+    conn.refcount += 1;
+
+    let new_id = {
+        let entry = state.next_id;
+        state.next_id += 1;
+        format!("s{}", entry)
+    };
+
+    let output = Arc::new(Mutex::new(OutputBuffer::default()));
+    let status = Arc::new(Mutex::new("running".to_string()));
+    let exit_status = Arc::new(Mutex::new(None));
+    let exit_signal = Arc::new(Mutex::new(None));
+    let drain_dead = Arc::new(Mutex::new(false));
+    let updated_at = Arc::new(Mutex::new(now_ms()));
+
+    let cmd_tx = spawn_drain_task(
+        channel,
+        output.clone(),
+        status.clone(),
+        exit_status.clone(),
+        exit_signal.clone(),
+        drain_dead.clone(),
+        updated_at.clone(),
+    )
+    .await;
+
+    let session = SessionHandle {
+        id: new_id.clone(),
+        connection_id: connection_id.clone(),
+        host,
+        port,
+        username,
+        cols: c,
+        rows: r,
+        reconnect: false,
+        connect_args,
+        created_at: now_ms(),
+        updated_at,
+        output,
+        status,
+        exit_status,
+        exit_signal,
+        cmd_tx,
+        drain_dead,
+    };
+
+    let summary = session.summary(&BTreeMap::new());
+    state.sessions.insert(new_id.clone(), session);
+
+    Ok(json!({"ok": true, "session_id": new_id, "connection_id": connection_id, "session": summary}))
 }
 
-/// Drain all currently available PTY output into the session buffer.
-/// Single non-blocking sweep — no retry loop.
-fn drain_output_now(session: &mut RemoteSession) {
-    let mut buf = [0_u8; 8192];
-    let mut saw_error = false;
-    loop {
-        match session.shell.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                session.output.extend_from_slice(&buf[..n]);
-                if session.output.len() > MAX_BUFFER {
-                    let drain = session.output.len() - MAX_BUFFER;
-                    session.output.drain(..drain);
-                    session.cursor = session.cursor.saturating_sub(drain);
-                }
-                session.updated_at = now_ms();
-            }
-            Err(error) => {
-                if error.kind() != std::io::ErrorKind::WouldBlock {
-                    saw_error = true;
-                }
-                break;
-            }
-        }
-    }
-    let mut stderr = session.shell.stderr();
-    loop {
-        match stderr.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                session.output.extend_from_slice(&buf[..n]);
-                if session.output.len() > MAX_BUFFER {
-                    let drain = session.output.len() - MAX_BUFFER;
-                    session.output.drain(..drain);
-                    session.cursor = session.cursor.saturating_sub(drain);
-                }
-                session.updated_at = now_ms();
-            }
-            Err(error) => {
-                if error.kind() != std::io::ErrorKind::WouldBlock {
-                    saw_error = true;
-                }
-                break;
-            }
-        }
-    }
-    if session.shell.eof() {
-        session.status = "closed".to_string();
-        if session.exit_status.is_none() {
-            session.exit_status = session.shell.exit_status().ok();
-        }
-        if session.exit_signal.is_none() {
-            session.exit_signal = session
-                .shell
-                .exit_signal()
-                .ok()
-                .and_then(|signal| signal.exit_signal);
-        }
-    } else if saw_error {
-        session.status = "disconnected".to_string();
-    }
-}
-
-/// Poll the PTY channel for output using non-blocking reads with retry.
-/// Uses the same proven pattern as `exec_channel`: WouldBlock → sleep → retry.
-/// Keeps polling until `poll_ms` has elapsed with no new data, or total
-/// `timeout_ms` is exceeded, or the session closes.
-pub fn refresh_session_state_poll(session: &mut RemoteSession, poll_ms: u64, timeout_ms: u64) {
-    let deadline = now_ms().saturating_add(u128::from(timeout_ms));
-    let mut idle_since = now_ms();
-
-    loop {
-        let before = session.output.len();
-
-        // Non-blocking drain sweep
-        drain_output_now(session);
-
-        // If we got new data, reset idle timer and immediately try again
-        if session.output.len() > before {
-            idle_since = now_ms();
-            continue;
-        }
-
-        // Check exit conditions
-        if now_ms().saturating_sub(idle_since) >= u128::from(poll_ms) {
-            break; // No new data for poll_ms
-        }
-        if now_ms() >= deadline {
-            break; // Total timeout exceeded
-        }
-        if matches!(session.status.as_str(), "closed" | "disconnected") {
-            break;
-        }
-
-        sleep_ms(50);
-    }
-}
-
-/// Legacy single-sweep refresh — used by heartbeat and lightweight checks
-/// where polling is not appropriate.
-pub fn refresh_session_state(session: &mut RemoteSession) {
-    drain_output_now(session);
-}
-
-pub fn page_output(
-    session: &mut RemoteSession,
-    offset: Option<usize>,
-    limit: usize,
-    strip_ansi_output: bool,
-) -> Value {
-    let start = offset.unwrap_or(session.cursor).min(session.output.len());
-    let end = (start + limit).min(session.output.len());
-    if offset.is_none() {
-        session.cursor = end;
-    }
-    render_output_page(&session.output, start, end, strip_ansi_output)
-}
-
-pub fn session_summary(session: &RemoteSession, all_sessions: &[SessionMetadataForTesting]) -> Value {
-    serde_json::json!({
-        "id": session.id,
-        "connection_id": session.connection_id,
-        "shared_with": shared_with_ids(&session.id, &session.connection_id, all_sessions),
-        "host": session.host,
-        "port": session.port,
-        "username": session.username,
-        "status": session.status,
-        "output_bytes": session.output.len(),
-        "cursor": session.cursor,
-        "created_at": session.created_at,
-        "updated_at": session.updated_at,
-        "cols": session.cols,
-        "rows": session.rows,
-    })
-}
-
-pub fn session_metadata(session: &RemoteSession) -> SessionMetadataForTesting {
-    SessionMetadataForTesting {
-        id: session.id.clone(),
-        connection_id: session.connection_id.clone(),
-    }
-}
-
-pub fn get_session_mut<'a>(
-    state: &'a mut ServerState,
+pub async fn daemon_exec(
     session_id: &str,
-) -> Result<&'a mut RemoteSession> {
-    state
+    cmd: &str,
+    timeout_ms: Option<u64>,
+    state: &mut crate::kernel::ServerState,
+) -> Result<Value> {
+    let session = state
+        .sessions
+        .get(session_id)
+        .ok_or_else(|| anyhow::anyhow!("session {} not found", session_id))?;
+
+    let conn = state
+        .connections
+        .get(&session.connection_id)
+        .ok_or_else(|| anyhow::anyhow!("connection {} not found", session.connection_id))?;
+
+    let mut channel = conn
+        .handle
+        .channel_open_session()
+        .await
+        .context("opening exec channel")?;
+
+    let (stdout, stderr, exit_code) =
+        connection::exec_channel(&mut channel, cmd, timeout_ms).await?;
+
+    Ok(json!({"ok": true, "stdout": stdout, "stderr": stderr, "exit_code": exit_code}))
+}
+
+pub async fn daemon_send(
+    session_id: &str,
+    input: &str,
+    crlf: bool,
+    expect_pairs: Vec<ExpectRespondPair>,
+    wait_ms: Option<u64>,
+    wait_idle: Option<u64>,
+    wait_for_exit: bool,
+    state: &mut crate::kernel::ServerState,
+) -> Result<Value> {
+    let session = state
         .sessions
         .get_mut(session_id)
-        .ok_or_else(|| anyhow!("session '{}' not found. Use 'agentssh session list' to see active sessions.", session_id))
+        .ok_or_else(|| anyhow::anyhow!("session {} not found", session_id))?;
+
+    let normalized = normalize_input(input, crlf);
+
+    session
+        .cmd_tx
+        .send(SessionCmd::Send { data: normalized.into_bytes() })
+        .map_err(|_| anyhow::anyhow!("drain task dead"))?;
+
+    if let Some(ms) = wait_ms {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+
+    if let Some(idle_ms) = wait_idle {
+        tokio::time::sleep(Duration::from_millis(idle_ms)).await;
+    }
+
+    for pair in expect_pairs {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let matches = {
+                let buf = session.output.lock().unwrap();
+                let haystack = String::from_utf8_lossy(&buf.data);
+                output_matches_str(&haystack, &pair.expect)?
+            };
+            if matches {
+                let normalized_resp = normalize_input(&pair.respond, true);
+                session
+                    .cmd_tx
+                    .send(SessionCmd::Send { data: normalized_resp.into_bytes() })
+                    .map_err(|_| anyhow::anyhow!("drain task dead"))?;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("timeout waiting for expect pattern: {}", pair.expect);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    if wait_for_exit {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let done = {
+                let st = session.status.lock().unwrap();
+                &*st != "running"
+            };
+            if done { break; }
+            if tokio::time::Instant::now() >= deadline { break; }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    let session = state.sessions.get(session_id).unwrap();
+    let output_val = session.page_output(0, util::DEFAULT_LIMIT, true);
+    let status = session.status.lock().unwrap().clone();
+    let exit_status = *session.exit_status.lock().unwrap();
+    let exit_signal = session.exit_signal.lock().unwrap().clone();
+
+    Ok(daemon_output_response(session_id, &output_val, &status, exit_status, exit_signal))
 }
+
+pub async fn daemon_read(
+    session_id: &str,
+    offset: usize,
+    limit: usize,
+    wait_ms: Option<u64>,
+    strip: Option<bool>,
+    state: &mut crate::kernel::ServerState,
+) -> Result<Value> {
+    let session = state
+        .sessions
+        .get(session_id)
+        .ok_or_else(|| anyhow::anyhow!("session {} not found", session_id))?;
+
+    if let Some(ms) = wait_ms {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+
+    let do_strip = strip.unwrap_or(true);
+    let output_val = session.page_output(offset, limit, do_strip);
+    let status = session.status.lock().unwrap().clone();
+    let exit_status = *session.exit_status.lock().unwrap();
+    let exit_signal = session.exit_signal.lock().unwrap().clone();
+
+    Ok(daemon_output_response(session_id, &output_val, &status, exit_status, exit_signal))
+}
+
+pub async fn daemon_resize(
+    session_id: &str,
+    cols: u32,
+    rows: u32,
+    state: &mut crate::kernel::ServerState,
+) -> Result<Value> {
+    let session = state
+        .sessions
+        .get_mut(session_id)
+        .ok_or_else(|| anyhow::anyhow!("session {} not found", session_id))?;
+
+    session.cols = cols;
+    session.rows = rows;
+    session
+        .cmd_tx
+        .send(SessionCmd::Resize { cols, rows })
+        .map_err(|_| anyhow::anyhow!("drain task dead"))?;
+
+    Ok(json!({"ok": true, "cols": cols, "rows": rows}))
+}
+
+pub async fn daemon_signal(
+    session_id: &str,
+    signal: &str,
+    state: &mut crate::kernel::ServerState,
+) -> Result<Value> {
+    let session = state
+        .sessions
+        .get_mut(session_id)
+        .ok_or_else(|| anyhow::anyhow!("session {} not found", session_id))?;
+
+    let sig = signal.to_uppercase();
+    session
+        .cmd_tx
+        .send(SessionCmd::Signal { signal: sig.clone() })
+        .map_err(|_| anyhow::anyhow!("drain task dead"))?;
+
+    Ok(json!({"ok": true, "signal": sig}))
+}
+
+pub async fn daemon_close(
+    session_id: &str,
+    state: &mut crate::kernel::ServerState,
+) -> Result<Value> {
+    let session = state
+        .sessions
+        .get(session_id)
+        .ok_or_else(|| anyhow::anyhow!("session {} not found", session_id))?;
+
+    let connection_id = session.connection_id.clone();
+    let _ = session.cmd_tx.send(SessionCmd::Close);
+
+    state.sessions.remove(session_id);
+
+    if let Some(conn) = state.connections.get_mut(&connection_id) {
+        conn.refcount = conn.refcount.saturating_sub(1);
+        if conn.refcount == 0 {
+            state.connections.remove(&connection_id);
+        }
+    }
+
+    Ok(json!({"ok": true, "closed": session_id}))
+}
+
+pub async fn daemon_status(
+    session_id: &str,
+    state: &mut crate::kernel::ServerState,
+) -> Result<Value> {
+    let session = state
+        .sessions
+        .get(session_id)
+        .ok_or_else(|| anyhow::anyhow!("session {} not found", session_id))?;
+
+    Ok(json!({"ok": true, "session": session.summary(&state.sessions)}))
+}
+
+pub async fn daemon_ping(
+    session_id: &str,
+    state: &mut crate::kernel::ServerState,
+) -> Result<Value> {
+    let session = state
+        .sessions
+        .get(session_id)
+        .ok_or_else(|| anyhow::anyhow!("session {} not found", session_id))?;
+
+    let alive = !*session.drain_dead.lock().unwrap()
+        && *session.status.lock().unwrap() == "running";
+
+    Ok(json!({"ok": true, "alive": alive, "session_id": session_id}))
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 pub fn normalize_input(input: &str, crlf: bool) -> String {
     if crlf {
@@ -267,477 +657,42 @@ pub fn normalize_input(input: &str, crlf: bool) -> String {
     }
 }
 
-pub fn attempt_reconnect(session: &mut RemoteSession) -> Option<(ssh2::Session, Channel)> {
-    if !session.reconnect {
-        return None;
-    }
-    let old_id = session.id.clone();
-    let _ = log_daemon(&format!("attempting reconnect for session {}", old_id));
-
-    let (new_ssh, _host, _port, _username) = match connect_with_info(session.connect_args.clone()) {
-        Ok(conn) => conn,
-        Err(e) => {
-            let _ = log_daemon(&format!("reconnect failed for session {}: {e:#}", old_id));
-            return None;
-        }
-    };
-
-    new_ssh.set_blocking(true);
-    let new_shell = match new_ssh.channel_session() {
-        Ok(mut shell) => {
-            if shell.request_pty("xterm-256color", None, Some((session.cols, session.rows, 0, 0))).is_err()
-                || shell.shell().is_err()
-            {
-                let _ = log_daemon(&format!("reconnect PTY failed for session {}", old_id));
-                return None;
-            }
-            shell
-        }
-        Err(e) => {
-            let _ = log_daemon(&format!("reconnect PTY failed for session {}: {e:#}", old_id));
-            return None;
-        }
-    };
-
-    let mut old_shell = std::mem::replace(&mut session.shell, new_shell);
-    let _ = old_shell.close();
-    let _ = old_shell.wait_close();
-    new_ssh.set_blocking(false);
-
-    session.status = "running".to_string();
-    session.updated_at = now_ms();
-    let notice = format!("\r\n[AgentSSH] session {} reconnected\r\n", old_id);
-    session.output.extend_from_slice(notice.as_bytes());
-    session.cursor = session.output.len();
-
-    let _ = log_daemon(&format!("session {} reconnected", old_id));
-    Some((new_ssh, old_shell))
-}
-
-pub fn daemon_connect(command: ConnectCommand, state: &mut ServerState) -> Result<Value> {
-    let connect_args = command.connect.clone();
-    let (ssh, host, port, username) = connect_with_info(command.connect)?;
-    let connection_id = next_connection_id(state);
-    let identity = SessionIdentity { host, port, username };
-    ssh.set_blocking(false);
-    state
-        .connections
-        .insert(connection_id.clone(), SharedConnection { ssh, refcount: 0 });
-    create_session(
-        state,
-        &connection_id,
-        identity,
-        command.cols,
-        command.rows,
-        command.wait_ms,
-        command.limit,
-        connect_args,
-        command.reconnect,
-    )
-}
-
-pub fn daemon_spawn(command: SpawnCommand, state: &mut ServerState) -> Result<Value> {
-    let source = state
-        .sessions
-        .get(&command.from)
-        .ok_or_else(|| anyhow!("session '{}' not found. Use 'agentssh session list' to see active sessions.", command.from))?;
-
-    let identity = SessionIdentity {
-        host: source.host.clone(),
-        port: source.port,
-        username: source.username.clone(),
-    };
-    let connection_id = source.connection_id.clone();
-    let connect_args = source.connect_args.clone();
-    let reconnect = source.reconnect;
-    create_session(
-        state,
-        &connection_id,
-        identity,
-        command.cols,
-        command.rows,
-        command.wait_ms,
-        command.limit,
-        connect_args,
-        reconnect,
-    )
-}
-
-pub fn daemon_exec(command: SessionExecCommand, state: &mut ServerState) -> Result<Value> {
-    let command_line = command.command.join(" ");
-
-    // Detach mode: write command to the PTY, drain output, return immediately
-    if command.detach {
-        let session = get_session_mut(state, &command.session_id)?;
-        ensure_session_connected(session)?;
-        session.shell.write_all(format!("{}\n", command_line).as_bytes())?;
-        refresh_session_state(session);
-        return Ok(serde_json::json!({
-            "session_id": command.session_id,
-            "command": command_line,
-            "detached": true,
-            "status": "dispatched"
-        }));
-    }
-
-    // Get the session's stored ConnectArgs to open a dedicated connection.
-    // The session's SSH transport has an active PTY channel (from `connect`)
-    // that conflicts with opening new channels via libssh2. A fresh connection
-    // eliminates the channel conflict at the cost of one extra TCP handshake
-    // (~500ms), which is negligible compared to command execution time.
-    let connect_args = {
-        let session = get_session_mut(state, &command.session_id)?;
-        ensure_session_connected(session)?;
-        session.connect_args.clone()
-    };
-
-    let (ssh, _host, _port, _username) = connect_with_info(connect_args)?;
-    let mut channel = ssh.channel_session()?;
-    let (stdout, stderr, exit_status) =
-        exec_channel(&ssh, &mut channel, &command_line, command.timeout)?;
-
-    Ok(serde_json::json!({
-        "session_id": command.session_id,
-        "exit_status": exit_status,
-        "stdout": stdout,
-        "stderr": stderr,
-    }))
-}
-
-pub fn daemon_send(command: SessionInputCommand, state: &mut ServerState) -> Result<Value> {
-    let expect_pairs = command.expect_pairs()?;
-
-    let session = get_session_mut(state, &command.session_id)?;
-    ensure_session_connected(session)?;
-
-    let input = normalize_input(&command.input, command.crlf);
-    session.shell.write_all(input.as_bytes())?;
-
-    // Poll for PTY output using non-blocking reads with retry (same pattern as exec_channel).
-    // wait_ms controls how long to wait for initial output; total timeout prevents hangs.
-    let poll_ms = command.wait_ms.max(500);
-    let total_timeout = command.timeout.unwrap_or(30_000);
-    refresh_session_state_poll(session, poll_ms, total_timeout);
-
-    // Handle expect/respond pairs
-    let mut auto_responses = Vec::new();
-    for pair in expect_pairs {
-        if output_matches(session, &pair.expect)? {
-            session.shell.write_all(pair.respond.as_bytes())?;
-            refresh_session_state_poll(session, poll_ms, total_timeout);
-            auto_responses.push(serde_json::json!({
-                "expect": pair.expect,
-                "responded": true,
-            }));
-        } else {
-            auto_responses.push(serde_json::json!({
-                "expect": pair.expect,
-                "responded": false,
-            }));
-        }
-    }
-
-    // wait-for-exit: mandatory 60s default timeout to prevent daemon deadlock
-    if command.wait_for_exit {
-        let timeout_ms = command.timeout.unwrap_or(DEFAULT_WAIT_FOR_EXIT_TIMEOUT_MS);
-        let deadline = now_ms().saturating_add(u128::from(timeout_ms));
-        while !matches!(session.status.as_str(), "closed" | "disconnected") {
-            if now_ms() >= deadline {
-                break;
-            }
-            refresh_session_state_poll(session, 500, 2000);
-        }
-    }
-
-    if let Some(idle_ms) = command.wait_idle {
-        let deadline = command
-            .timeout
-            .map(|timeout_ms| now_ms().saturating_add(u128::from(timeout_ms)));
-        let mut last_output_len = session.output.len();
-        let mut idle_since = now_ms();
-        loop {
-            if let Some(deadline) = deadline {
-                if now_ms() >= deadline {
-                    break;
-                }
-            }
-            refresh_session_state_poll(session, 200, 2000);
-            let current_len = session.output.len();
-            if current_len != last_output_len {
-                last_output_len = current_len;
-                idle_since = now_ms();
-            } else if now_ms().saturating_sub(idle_since) >= u128::from(idle_ms) {
-                break;
-            }
-            if matches!(session.status.as_str(), "closed" | "disconnected") {
-                break;
-            }
-        }
-    }
-
-    let page = page_output(session, None, command.limit, should_strip_ansi(command.raw));
-    let mut response = daemon_output_response(
-        &session.id,
-        page,
-        &session.status,
-        session.exit_status,
-        session.exit_signal.clone(),
-    );
-    if !auto_responses.is_empty() {
-        response["auto_responses"] = serde_json::Value::Array(auto_responses);
-    }
-    Ok(response)
-}
-
-pub fn daemon_read(command: ReadCommand, state: &mut ServerState) -> Result<Value> {
-    let session = get_session_mut(state, &command.session_id)?;
-
-    // Poll for any new PTY output using non-blocking reads with retry
-    let poll_ms = command.wait_ms.max(500);
-    refresh_session_state_poll(session, poll_ms, command.timeout);
-
-    let page = page_output(session, command.offset, command.limit, should_strip_ansi(command.raw));
-    Ok(daemon_output_response(
-        &session.id,
-        page,
-        &session.status,
-        session.exit_status,
-        session.exit_signal.clone(),
-    ))
-}
-
-pub fn daemon_resize(command: ResizeCommand, state: &mut ServerState) -> Result<Value> {
-    let session = get_session_mut(state, &command.session_id)?;
-    ensure_session_connected(session)?;
-    session.cols = command.cols;
-    session.rows = command.rows;
-    session
-        .shell
-        .request_pty_size(command.cols, command.rows, None, None)?;
-    session.updated_at = now_ms();
-    Ok(serde_json::json!({ "session_id": session.id, "cols": command.cols, "rows": command.rows }))
-}
-
-pub fn daemon_signal(command: SignalCommand, state: &mut ServerState) -> Result<Value> {
-    let session = get_session_mut(state, &command.session_id)?;
-    ensure_session_connected(session)?;
-    match command.signal.as_str() {
-        "INT" | "SIGINT" => session.shell.write_all(b"\x03")?,
-        "QUIT" | "SIGQUIT" => session.shell.write_all(b"\x1c")?,
-        "TSTP" | "SIGTSTP" => session.shell.write_all(b"\x1a")?,
-        "TERM" | "SIGTERM" | "KILL" | "SIGKILL" => {
-            let _ = session.shell.close();
-            session.status = "closed".to_string();
-        }
-        _ => bail!("unsupported signal '{}'. Supported signals: INT, QUIT, TSTP, TERM, KILL.", command.signal),
-    }
-    session.updated_at = now_ms();
-    Ok(serde_json::json!({ "session_id": session.id, "signal": command.signal }))
-}
-
-pub fn daemon_status(session_id: &str, state: &mut ServerState) -> Result<Value> {
-    {
-        let session = get_session_mut(state, session_id)?;
-        refresh_session_state(session);
-    }
-    let all_sessions = state.sessions.values().map(session_metadata).collect::<Vec<_>>();
-    let session = state
-        .sessions
-        .get(session_id)
-        .ok_or_else(|| anyhow!("session '{}' not found. Use 'agentssh session list' to see active sessions.", session_id))?;
-    Ok(session_summary(session, &all_sessions))
-}
-
-pub fn daemon_ping(session_id: &str, state: &mut ServerState) -> Result<Value> {
-    let session = get_session_mut(state, session_id)?;
-    refresh_session_state(session);
-    Ok(serde_json::json!({
-        "session_id": session.id,
-        "alive": session.status == "running",
-        "status": session.status,
-    }))
+pub fn shared_with_ids(
+    session_id: &str,
+    connection_id: &str,
+    all_sessions: &BTreeMap<String, SessionHandle>,
+) -> Vec<String> {
+    all_sessions
+        .iter()
+        .filter(|(id, s)| *id != session_id && s.connection_id == connection_id)
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 pub fn daemon_output_response(
     session_id: &str,
-    output: Value,
+    output: &Value,
     status: &str,
     exit_status: Option<i32>,
     exit_signal: Option<String>,
 ) -> Value {
-    let mut response = serde_json::json!({
+    json!({
+        "ok": true,
         "session_id": session_id,
         "output": output,
         "status": status,
-    });
-    if let Some(code) = exit_status {
-        response["exit_status"] = serde_json::json!(code);
-    }
-    if let Some(signal) = exit_signal {
-        response["exit_signal"] = serde_json::json!(signal);
-    }
-    response
-}
-
-fn render_output_page(output: &[u8], start: usize, end: usize, strip_ansi_output: bool) -> Value {
-    let text = String::from_utf8_lossy(&output[start..end]).to_string();
-    serde_json::json!({
-        "text": if strip_ansi_output { strip_ansi(&text) } else { text },
-        "offset": start,
-        "next_offset": end,
-        "total": output.len(),
+        "exit_status": exit_status,
+        "exit_signal": exit_signal.unwrap_or_default(),
     })
 }
 
-fn should_strip_ansi(raw: bool) -> bool {
-    !raw
-}
-
-pub fn shared_with_ids(
-    session_id: &str,
-    connection_id: &str,
-    all_sessions: &[SessionMetadataForTesting],
-) -> Vec<String> {
-    all_sessions
-        .iter()
-        .filter(|session| session.connection_id == connection_id && session.id != session_id)
-        .map(|session| session.id.clone())
-        .collect()
-}
-
-#[cfg(test)]
-pub fn session_summary_for_testing(
-    session: &SessionMetadataForTesting,
-    all_sessions: &[SessionMetadataForTesting],
-) -> Value {
-    serde_json::json!({
-        "id": session.id,
-        "connection_id": session.connection_id,
-        "shared_with": shared_with_ids(&session.id, &session.connection_id, all_sessions),
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        SessionMetadataForTesting, daemon_output_response, render_output_page, session_summary_for_testing,
-        shared_with_ids, should_strip_ansi,
-    };
-    use crate::cli::ExpectRespondPair;
-    use crate::util::strip_ansi;
-
-    #[test]
-    fn daemon_output_response_omits_terminal_fields_when_absent() {
-        let response = daemon_output_response("s1", serde_json::json!({ "text": "" }), "running", None, None);
-
-        assert_eq!(response["session_id"], "s1");
-        assert_eq!(response["status"], "running");
-        assert!(response.get("exit_status").is_none());
-        assert!(response.get("exit_signal").is_none());
-    }
-
-    #[test]
-    fn daemon_output_response_includes_terminal_fields_when_present() {
-        let response = daemon_output_response(
-            "s1",
-            serde_json::json!({ "text": "" }),
-            "closed",
-            Some(1),
-            Some("TERM".to_string()),
-        );
-
-        assert_eq!(response["exit_status"], 1);
-        assert_eq!(response["exit_signal"], "TERM");
-    }
-
-    #[test]
-    fn shared_with_ids_only_lists_other_sessions_on_same_connection() {
-        let all_sessions = vec![
-            SessionMetadataForTesting {
-                id: "s1".to_string(),
-                connection_id: "c1".to_string(),
-            },
-            SessionMetadataForTesting {
-                id: "s2".to_string(),
-                connection_id: "c1".to_string(),
-            },
-            SessionMetadataForTesting {
-                id: "s3".to_string(),
-                connection_id: "c2".to_string(),
-            },
-        ];
-
-        let shared = shared_with_ids("s1", "c1", &all_sessions);
-        assert_eq!(shared, vec!["s2".to_string()]);
-    }
-
-    #[test]
-    fn session_summary_includes_connection_group_metadata() {
-        let summary = session_summary_for_testing(
-            &SessionMetadataForTesting {
-                id: "s2".to_string(),
-                connection_id: "c1".to_string(),
-            },
-            &[
-                SessionMetadataForTesting {
-                    id: "s1".to_string(),
-                    connection_id: "c1".to_string(),
-                },
-                SessionMetadataForTesting {
-                    id: "s2".to_string(),
-                    connection_id: "c1".to_string(),
-                },
-            ],
-        );
-
-        assert_eq!(summary["connection_id"], "c1");
-        assert_eq!(summary["shared_with"], serde_json::json!(["s1"]));
-    }
-
-    #[test]
-    fn regex_fallback_to_substring_matching_is_case_insensitive() {
-        let pair = ExpectRespondPair {
-            expect: "[sudo] password".to_string(),
-            respond: "secret\n".to_string(),
-        };
-        let output = "Prompt: [SUDO] PASSWORD for root:".to_string();
-        let matched = {
-            let output_lower = output.to_lowercase();
-            let expect_lower = pair.expect.to_lowercase();
-            let regex = regex::RegexBuilder::new(&pair.expect).case_insensitive(true).build();
-            match regex {
-                Ok(compiled) => compiled.is_match(&output) || output_lower.contains(&expect_lower),
-                Err(_) => output_lower.contains(&expect_lower),
-            }
-        };
-
-        assert!(matched);
-    }
-
-    #[test]
-    fn render_output_page_strips_ansi_by_default() {
-        let output = [104_u8, 101, 108, 108, 111, 32, 27, 91, 51, 49, 109, 114, 101, 100, 27, 91, 48, 109];
-
-        let page = render_output_page(&output, 0, output.len(), true);
-
-        assert_eq!(page["text"], "hello red");
-        assert_eq!(page["total"], output.len());
-    }
-
-    #[test]
-    fn render_output_page_preserves_ansi_when_raw_requested() {
-        let output = [104_u8, 101, 108, 108, 111, 32, 27, 91, 51, 49, 109, 114, 101, 100, 27, 91, 48, 109];
-
-        let page = render_output_page(&output, 0, output.len(), false);
-
-        let expected = String::from_utf8_lossy(&output).to_string();
-        assert_eq!(page["text"], expected);
-        assert_eq!(strip_ansi(&expected), "hello red");
-    }
-
-    #[test]
-    fn should_strip_ansi_defaults_to_true_unless_raw_requested() {
-        assert!(should_strip_ansi(false));
-        assert!(!should_strip_ansi(true));
+fn output_matches_str(haystack: &str, pattern: &str) -> Result<bool> {
+    use regex::RegexBuilder;
+    let haystack_lower = haystack.to_lowercase();
+    let pattern_lower = pattern.to_lowercase();
+    let regex = RegexBuilder::new(pattern).case_insensitive(true).build();
+    match regex {
+        Ok(compiled) => Ok(compiled.is_match(haystack) || haystack_lower.contains(&pattern_lower)),
+        Err(_) => Ok(haystack_lower.contains(&pattern_lower)),
     }
 }
