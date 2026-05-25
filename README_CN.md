@@ -7,7 +7,7 @@
 
 **为 AI 而生的 SSH 工具箱。** 不是给人看的终端，不是 OpenSSH 的封装。是一个能说 JSON 的可编程后端——为 agent 设计，人也能用。
 
-AgentSSH 通过 `libssh2` 直接跟 SSH 协议对话。没有 shell 包装，没有屏幕抓取，没有启发式猜测。
+AgentSSH 通过 `russh` 直接跟 SSH 协议对话。没有 shell 包装，没有屏幕抓取，没有启发式猜测。
 
 ---
 
@@ -26,7 +26,7 @@ agent 将获得：`exec`、文件上传下载、会话管理、端口转发、SO
 | 🎯 **输出格式** | 带 ANSI 转义码的原始终端文本 | 带状态码的结构化 JSON |
 | 🔌 **连接模型** | 连接 → 执行 → 断开 | 长连接守护进程，会话复用 |
 | 📡 **端口转发** | 每个终端手动 `ssh -L` / `ssh -D` | 守护进程管理的隧道 & SOCKS5 代理 |
-| 🗂️ **文件传输** | 单独的 `scp`/`sftp` 命令 | 内置 SFTP → SCP → exec 三级回退链 |
+| 🗂️ **文件传输** | 单独的 `scp`/`sftp` 命令 | 内置 SFTP → exec 二级回退链 |
 | 🔐 **认证配置** | `~/.ssh/config`（自定义语法） | JSON 配置文件，可程序化写入 |
 | 🪟 **Windows** | 能用但别扭 | 自动检测并启用 PowerShell 回退 |
 | 📟 **输出导航** | 终端里滚屏 | 游标分页：`--offset` / `--limit` |
@@ -36,10 +36,6 @@ agent 将获得：`exec`、文件上传下载、会话管理、端口转发、SO
 ## 🚀 快速开始
 
 ```bash
-# 安装依赖
-brew install libssh2        # macOS
-# apt install libssh2-dev   # Linux
-
 # 从 crates.io 安装（推荐）
 cargo install agentssh
 
@@ -111,13 +107,13 @@ agentssh session close --session-id s1
 ### 📁 文件传输（多协议自动切换）
 
 ```bash
-# 默认 auto 模式：SFTP → SCP → exec（Linux、macOS、Windows 通吃！）
+# 默认 auto 模式：SFTP → exec（Linux、macOS、Windows 通吃！）
 agentssh file upload --profile prod --local ./app --remote /opt/app
 agentssh file download --profile prod --remote /var/log/syslog --local ./syslog
 agentssh file ls --profile prod --remote /var/www
 
 # 强制指定传输协议
-agentssh file upload --profile windows --method scp --local ./app --remote C:/app
+agentssh file upload --profile prod --method sftp --local ./app --remote /opt/app
 ```
 
 ### 🌐 端口转发 & SOCKS5 代理
@@ -153,7 +149,7 @@ agentssh proxy close --all
 │  (会话模式)  │                      │  └─────────────┘  │
 └──────────────┘                      └───────┬──────────┘
                                               │
-                                     SSH (libssh2)
+                                      SSH (russh)
                                               │
                                     ┌─────────▼─────────┐
                                     │  远程服务器         │
@@ -190,8 +186,8 @@ agentssh session list                  # 列出所有会话 + 连接分组
 agentssh session close                 # 关闭会话
 
 # 📁 文件操作
-agentssh file upload                   # 上传（SFTP → SCP → exec）
-agentssh file download                 # 下载（SFTP → SCP → exec）
+agentssh file upload                   # 上传（SFTP → exec）
+agentssh file download                 # 下载（SFTP → exec）
 agentssh file ls                       # 列出远程目录
 
 # 🌐 代理 & 隧道
@@ -244,7 +240,6 @@ agentssh daemon shutdown               # 停止守护进程 + 清理
 ## 🔧 从源码编译
 
 - **Rust** ≥ 1.85（edition 2024）
-- **libssh2** 系统库（`brew install libssh2` / `apt install libssh2-dev`）
 - **仅 Unix**（使用 Unix domain socket，不支持 Windows 本地编译，但可以连接 Windows 远程服务器）
 
 ```bash

@@ -9,7 +9,7 @@
 
 **AI-native SSH toolkit.** Not a human terminal. Not an OpenSSH wrapper. A programmable backend that speaks JSON — built for agents, works for humans.
 
-AgentSSH talks SSH directly through `libssh2`. No shell wrappers. No screen scraping. No heuristics.
+AgentSSH talks SSH directly through `russh`. No shell wrappers. No screen scraping. No heuristics.
 
 ---
 
@@ -28,7 +28,7 @@ The agent gains: `exec`, `file upload/download`, session management, port forwar
 | 🎯 **Output** | Raw ANSI terminal text | Structured JSON with status codes |
 | 🔌 **Connection** | Connect → run → disconnect | Long-lived daemon, session reuse |
 | 📡 **Port forwarding** | `ssh -L` / `ssh -D` per terminal | Daemon-managed tunnels & SOCKS5 proxy |
-| 🗂️ **File transfer** | Separate `scp`/`sftp` binary | Built-in SFTP → SCP → exec fallback chain |
+| 🗂️ **File transfer** | Separate `scp`/`sftp` binary | Built-in SFTP → exec fallback chain |
 | 🔐 **Auth config** | `~/.ssh/config` (custom grammar) | JSON profiles, machine-writable |
 | 🪟 **Windows** | Works but clunky | Auto-detects & uses PowerShell fallback |
 | 📟 **Output nav** | Scroll back in terminal | Cursor-based paging with `--offset` / `--limit` |
@@ -38,10 +38,6 @@ The agent gains: `exec`, `file upload/download`, session management, port forwar
 ## 🚀 Quick start
 
 ```bash
-# Prerequisites
-brew install libssh2        # macOS
-# apt install libssh2-dev   # Linux
-
 # Install from crates.io (recommended)
 cargo install agentssh
 
@@ -113,13 +109,13 @@ agentssh session close --session-id s1
 ### 📁 File transfer (multi-protocol)
 
 ```bash
-# Default auto: SFTP → SCP → exec (works on Linux, macOS, and Windows!)
+# Default auto: SFTP → exec (works on Linux, macOS, and Windows!)
 agentssh file upload --profile prod --local ./app --remote /opt/app
 agentssh file download --profile prod --remote /var/log/syslog --local ./syslog
 agentssh file ls --profile prod --remote /var/www
 
 # Force a specific protocol
-agentssh file upload --profile windows --method scp --local ./app --remote C:/app
+agentssh file upload --profile prod --method sftp --local ./app --remote /opt/app
 ```
 
 ### 🌐 Port forwarding & SOCKS5
@@ -155,7 +151,7 @@ agentssh proxy close --all
 │  (session)   │                      │  └─────────────┘  │
 └──────────────┘                      └───────┬──────────┘
                                               │
-                                     SSH (libssh2)
+                                     SSH (russh)
                                               │
                                     ┌─────────▼─────────┐
                                     │  Remote servers    │
@@ -192,8 +188,8 @@ agentssh session list                  # List sessions + connection groups
 agentssh session close                 # Close session
 
 # 📁 Files
-agentssh file upload                   # Upload (SFTP → SCP → exec)
-agentssh file download                 # Download (SFTP → SCP → exec)
+agentssh file upload                   # Upload (SFTP → exec)
+agentssh file download                 # Download (SFTP → exec)
 agentssh file ls                       # List remote directory
 
 # 🌐 Proxy & tunnels
@@ -242,7 +238,6 @@ agentssh daemon shutdown               # Stop daemon + cleanup
 ## 🔧 Building
 
 - **Rust** ≥ 1.85 (edition 2024)
-- **libssh2** system library (`brew install libssh2` / `apt install libssh2-dev`)
 - **Unix only** (uses Unix domain sockets)
 
 ```bash
