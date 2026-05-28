@@ -1,37 +1,43 @@
 # 🦾 AgentSSH
 
-[![Crates.io](https://img.shields.io/crates/v/agentssh.svg)](https://crates.io/crates/agentssh)
-[![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://rust-lang.org)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-macOS%20|%20Linux-lightgrey.svg)]()
+[![Crates.io](https://img.shields.io/crates/v/agentssh?style=flat-square&logo=rust)](https://crates.io/crates/agentssh)
+[![Rust](https://img.shields.io/badge/rust-1.85+-ed8225?style=flat-square&logo=rust&logoColor=white)](https://rust-lang.org)
+[![License](https://img.shields.io/badge/license-MIT-22C55E?style=flat-square)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-macOS%20|%20Linux-8B5CF6?style=flat-square)]()
+[![Downloads](https://img.shields.io/crates/d/agentssh?style=flat-square&label=downloads)](https://crates.io/crates/agentssh)
 
 [📖 中文文档](README_CN.md)
 
-**AI-native SSH toolkit.** Not a human terminal. Not an OpenSSH wrapper. A programmable backend that speaks JSON — built for agents, works for humans.
+**AI-native SSH toolkit. Not a human terminal. Not an OpenSSH wrapper.**
 
-AgentSSH talks SSH directly through `russh`. No shell wrappers. No screen scraping. No heuristics.
+AgentSSH speaks SSH directly through `russh` — a pure-Rust async SSH implementation. One binary: client + daemon + proxy. No C library to install. No shell wrapping. All output in structured JSON. Built for agents, also works for humans.
+
+[🐙 GitHub](https://github.com/cft0808/agentssh) · [📦 crates.io](https://crates.io/crates/agentssh) · [🔧 Quick Start](#-quick-start) · [🏗️ Architecture](#-architecture) · [📋 Command Reference](#-command-reference)
 
 ---
 
 ## 🤖 AI Agent Skill
 
-Drop [`SKILL.md`](SKILL.md) into your agent's skill directory to give it SSH superpowers. Different agents use different paths — follow your agent's documentation for where to install skills.
+Drop [`SKILL.md`](SKILL.md) into your agent's skill directory to give it SSH superpowers.
 
-The agent gains: `exec`, `file upload/download`, session management, port forwarding, SOCKS5 proxy — all via structured JSON. See [SKILL.md](SKILL.md) for the full capability definition.
+Your agent gains: `exec`, `file upload/download`, session management, port forwarding, SOCKS5 proxy — all via structured JSON. See [SKILL.md](SKILL.md) for the full capability definition.
 
 ---
 
-## ✨ Why AgentSSH
+## 🆚 Why AgentSSH
 
-|  | Traditional SSH | AgentSSH |
-|---|---|---|
-| 🎯 **Output** | Raw ANSI terminal text | Structured JSON with status codes |
-| 🔌 **Connection** | Connect → run → disconnect | Long-lived daemon, session reuse |
-| 📡 **Port forwarding** | `ssh -L` / `ssh -D` per terminal | Daemon-managed tunnels & SOCKS5 proxy |
-| 🗂️ **File transfer** | Separate `scp`/`sftp` binary | Built-in SFTP → exec fallback chain |
-| 🔐 **Auth config** | `~/.ssh/config` (custom grammar) | JSON profiles, machine-writable |
-| 🪟 **Windows** | Works but clunky | Auto-detects & uses PowerShell fallback |
-| 📟 **Output nav** | Scroll back in terminal | Cursor-based paging with `--offset` / `--limit` |
+|  | `ssh` | `paramiko` | `libssh2` | **AgentSSH** |
+|---|---|---|---|---|
+| **Output** | Raw terminal | Mixed string | App parses | **✅ Structured JSON** |
+| **Connections** | One shot | Manual | Manual | **✅ Daemon-pooled + reuse** |
+| **File transfer** | `scp` / `sftp` | Separate impl | Separate impl | **✅ SFTP → exec built-in** |
+| **Port forward** | `-L` / `-D` flags | Manual coding | Manual coding | **✅ Daemon-managed** |
+| **PTY model** | Screen-scraped | Blocking reads | Polling loops | **✅ Async drain task** |
+| **Auth config** | `~/.ssh/config` | Inline params | Inline params | **✅ JSON profiles** |
+| **C dependency** | Yes | Yes | **Yes** | **None — pure Rust** |
+| **Agent-first** | ❌ | ❌ | ❌ | **✅ `--json` everywhere** |
+
+> **The last two rows are the whole point.** No C library to fight with. No screen scraping. Programs call AgentSSH like they'd call an API.
 
 ---
 
@@ -92,11 +98,21 @@ agentssh session exec --session-id s1 -- uname -a
 # → {"exit_status":0, "stdout":"Linux ...\n", "stderr":""}
 
 # Interactive PTY mode
-agentssh session send --session-id s1 --input "ls -la\n"
+agentssh session send --session-id s1 --input $'ls -la\n'
 agentssh session send --session-id s1 \
-  --input "sudo systemctl restart nginx\n" \
+  --input $'sudo systemctl restart nginx\n' \
   --expect "[sudo] password" \
-  --respond "mypassword\n"
+  --respond $'mypassword\n'
+
+> **⚠️ `--input` needs a real newline.** `"echo hello\n"` sends two literal characters `\` and `n` — the shell won't execute the command. Use `$'echo hello\n'` (ANSI-C quoting) or embed an actual line break so the shell gets a real Enter.
+>
+> ```bash
+> # ✅ ANSI-C quoting — sends a real Enter to the PTY
+> agentssh session send --session-id s1 --input $'ls -la\n'
+>
+> # ❌ This sends literal \ and n — shell just echoes, never runs
+> agentssh session send --session-id s1 --input "ls -la\n"
+> ```
 
 agentssh session read --session-id s1          # latest output
 agentssh session read --session-id s1 --follow # stream live
@@ -239,6 +255,7 @@ agentssh daemon shutdown               # Stop daemon + cleanup
 
 - **Rust** ≥ 1.85 (edition 2024)
 - **Unix only** (uses Unix domain sockets)
+- **No C library required** — russh is pure Rust
 
 ```bash
 cargo build --release

@@ -1,35 +1,41 @@
 # 🦾 AgentSSH
 
-[![Crates.io](https://img.shields.io/crates/v/agentssh.svg)](https://crates.io/crates/agentssh)
-[![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://rust-lang.org)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-macOS%20|%20Linux-lightgrey.svg)]()
+[![Crates.io](https://img.shields.io/crates/v/agentssh?style=flat-square&logo=rust)](https://crates.io/crates/agentssh)
+[![Rust](https://img.shields.io/badge/rust-1.85+-ed8225?style=flat-square&logo=rust&logoColor=white)](https://rust-lang.org)
+[![License](https://img.shields.io/badge/license-MIT-22C55E?style=flat-square)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-macOS%20|%20Linux-8B5CF6?style=flat-square)]()
+[![Downloads](https://img.shields.io/crates/d/agentssh?style=flat-square&label=downloads)](https://crates.io/crates/agentssh)
 
-**为 AI 而生的 SSH 工具箱。** 不是给人看的终端，不是 OpenSSH 的封装。是一个能说 JSON 的可编程后端——为 agent 设计，人也能用。
+**为 AI 而生的 SSH 工具箱。** 不是给人看的终端，不是 OpenSSH 的封装。
 
-AgentSSH 通过 `russh` 直接跟 SSH 协议对话。没有 shell 包装，没有屏幕抓取，没有启发式猜测。
+AgentSSH 通过 `russh` — 纯 Rust 异步 SSH 实现 — 直接跟 SSH 协议对话。一个二进制文件：客户端 + 守护进程 + 代理。无需安装 C 库。没有 shell 包装。输出全部结构化 JSON。为 agent 设计，人也能用。
+
+[🐙 GitHub](https://github.com/cft0808/agentssh) · [📦 crates.io](https://crates.io/crates/agentssh) · [🔧 快速上手](#-快速上手) · [🏗️ 架构](#-架构) · [📋 命令速查](#-命令速查)
 
 ---
 
 ## 🤖 AI Agent Skill
 
-把 [`SKILL.md`](SKILL.md) 放入你的 agent skills 目录，赋予它 SSH 能力。不同 agent 的 skill 目录位置不同——请参照你所用 agent 的文档。
+把 [`SKILL.md`](SKILL.md) 放入你的 agent skills 目录，赋予它 SSH 能力。
 
 agent 将获得：`exec`、文件上传下载、会话管理、端口转发、SOCKS5 代理——全部通过结构化 JSON。详见 [SKILL.md](SKILL.md)。
 
 ---
 
-## ✨ 为什么选 AgentSSH
+## 🆚 为什么选 AgentSSH
 
-|  | 传统 SSH | AgentSSH |
-|---|---|---|
-| 🎯 **输出格式** | 带 ANSI 转义码的原始终端文本 | 带状态码的结构化 JSON |
-| 🔌 **连接模型** | 连接 → 执行 → 断开 | 长连接守护进程，会话复用 |
-| 📡 **端口转发** | 每个终端手动 `ssh -L` / `ssh -D` | 守护进程管理的隧道 & SOCKS5 代理 |
-| 🗂️ **文件传输** | 单独的 `scp`/`sftp` 命令 | 内置 SFTP → exec 二级回退链 |
-| 🔐 **认证配置** | `~/.ssh/config`（自定义语法） | JSON 配置文件，可程序化写入 |
-| 🪟 **Windows** | 能用但别扭 | 自动检测并启用 PowerShell 回退 |
-| 📟 **输出导航** | 终端里滚屏 | 游标分页：`--offset` / `--limit` |
+|  | `ssh` | `paramiko` | `libssh2` | **AgentSSH** |
+|---|---|---|---|---|
+| **输出** | 原始终端 | 混合字符串 | 程序解析 | **✅ 结构化 JSON** |
+| **连接** | 用完即断 | 手动管理 | 手动管理 | **✅ 守护进程池化复用** |
+| **文件传输** | `scp`/`sftp` | 单独实现 | 单独实现 | **✅ SFTP → exec 内置** |
+| **端口转发** | `-L`/`-D` 参数 | 手动编码 | 手动编码 | **✅ 守护进程管理** |
+| **PTY 模型** | 屏幕抓取 | 阻塞读取 | 轮询循环 | **✅ 异步 drain task** |
+| **认证配置** | `~/.ssh/config` | 内联参数 | 内联参数 | **✅ JSON 配置文件** |
+| **C 依赖** | 有 | 有 | **有** | **无 — 纯 Rust** |
+| **Agent 优先** | ❌ | ❌ | ❌ | **✅ `--json` 全覆盖** |
+
+> **最后两行是核心。** 无需折腾 C 库。无需屏幕抓取。程序调用 AgentSSH 就像调用 API。
 
 ---
 
@@ -90,11 +96,21 @@ agentssh session exec --session-id s1 -- uname -a
 # → {"exit_status":0, "stdout":"Linux ...\n", "stderr":""}
 
 # 交互式 PTY 模式
-agentssh session send --session-id s1 --input "ls -la\n"
+agentssh session send --session-id s1 --input $'ls -la\n'
 agentssh session send --session-id s1 \
-  --input "sudo systemctl restart nginx\n" \
+  --input $'sudo systemctl restart nginx\n' \
   --expect "[sudo] password" \
-  --respond "mypassword\n"
+  --respond $'mypassword\n'
+
+> **⚠️ `--input` 需要真正的换行符。** `"echo hello\n"` 传进去的是两个字面量字符 `\` 和 `n` —— shell 不会执行命令。请使用 `$'echo hello\n'`（ANSI-C 引号）或写入真实的回车。
+>
+> ```bash
+> # ✅ ANSI-C 引号 — 把真正的回车发给 PTY
+> agentssh session send --session-id s1 --input $'ls -la\n'
+>
+> # ❌ 这样只传了 \ 和 n 两个字符 — shell 只会回显，不执行
+> agentssh session send --session-id s1 --input "ls -la\n"
+> ```
 
 agentssh session read --session-id s1          # 读最新输出
 agentssh session read --session-id s1 --follow # 实时流式读取
@@ -237,10 +253,11 @@ agentssh daemon shutdown               # 停止守护进程 + 清理
 
 ---
 
-## 🔧 从源码编译
+## 🔧 编译
 
 - **Rust** ≥ 1.85（edition 2024）
-- **仅 Unix**（使用 Unix domain socket，不支持 Windows 本地编译，但可以连接 Windows 远程服务器）
+- **仅 Unix**（使用 Unix domain socket）
+- **无需 C 库** — russh 是纯 Rust 实现
 
 ```bash
 cargo build --release

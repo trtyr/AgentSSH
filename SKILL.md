@@ -302,6 +302,8 @@ agentssh session send --session-id s1 \
 
 Additional flags:
 
+> **⚠️ `--input` needs a real newline.** `"echo hello\n"` sends two literal characters `\` and `n` — the shell won't execute the command. Use `$'echo hello\n'` (ANSI-C quoting) or embed an actual line break so the shell gets a real Enter.
+
 - `--crlf` — converts LF to CRLF in input (useful for Windows targets)
 - `--wait-for-exit` — block until the shell exits or timeout
 - `--wait-idle <ms>` — wait for output to settle (no new data for this many ms) before returning. Useful for capturing full command output in one call instead of polling `session read`.
