@@ -12,7 +12,7 @@ cargo build --release          # release binary at target/release/agentssh
 
 **Rust edition 2024** — needs Rust ≥ 1.85. If `cargo build` fails with edition errors, update rustup.
 
-**libssh2 C library** — the `ssh2` crate wraps libssh2. On macOS: `brew install libssh2`. On Linux: `libssh2-dev` (or equivalent). If linking fails, install the system package, not a vendored build.
+**Pure Rust — no C dependencies.** Uses `russh` (async SSH) and `russh-sftp`. No system library installation required.
 
 **Unix only.** Uses `UnixListener`/`UnixStream`; will not compile on Windows.
 
@@ -26,7 +26,7 @@ Microkernel design. The CLI binary is both client and daemon — the same binary
 | `connect`       | `kernel::run_client(WireRequest::Connect)`                           | Starts a long-lived PTY session and a shared SSH connection entry         |
 | `session *`     | `kernel::run_client()` / `kernel::run_read_command()`                | Daemon-backed session lifecycle, spawn, exec, health, and streaming reads |
 | `file *`        | daemon or one-shot SSH depending on `--session-id`                   | Shared transfer structs, dual-path routing                                |
-| `proxy *`       | `kernel::run_client()` → daemon-managed threads                      | Local port forwarding (`-L`) and SOCKS5 (`-D`) via `channel_direct_tcpip` |
+| `proxy *`       | `kernel::run_client()` → daemon-managed async tasks                   | Local port forwarding (`-L`) and SOCKS5 (`-D`) via `channel_direct_tcpip` |
 | `profile *`     | `profile::run_profile()`                                             | Direct file I/O, no daemon                                                |
 | `daemon *`      | `kernel::run_server()` / `kernel::run_client(WireRequest::Shutdown)` | Daemon lifecycle commands                                                 |
 
@@ -37,7 +37,7 @@ Key modules:
 - `kernel.rs` — daemon lifecycle, Unix-socket IPC, `ServerState`, heartbeat thread, follow-read client loop
 - `protocol.rs` — `WireRequest`/`WireResponse`, JSON-line wire protocol over Unix socket
 - `ssh_backend.rs` — SSH/PTY/SFTP logic, session health refresh, ping handling
-- `proxy.rs` — local port forwarding and SOCKS5 proxy, listener threads, SOCKS5 handshake (RFC 1928)
+- `proxy.rs` — local port forwarding and SOCKS5 proxy, async listener, SOCKS5 handshake (RFC 1928)
 - `profile.rs` — CRUD for `~/.config/agentssh/profiles.json`
 - `util.rs` — constants (defaults), `config_dir()`, `runtime_socket_path()`, `expand_home()`, JSON helpers
 
@@ -94,7 +94,7 @@ This keeps session output readable for AI agents even when the remote shell uses
 ## Session health
 
 - `session ping --session-id <id>` refreshes the target session and returns `alive` plus current `status`.
-- Health for spawned sessions is shared at the SSH transport level because all channels in the same `connection_id` use one pooled `ssh2::Session`.
+- Health for spawned sessions is shared at the SSH transport level because all channels in the same `connection_id` use one pooled SSH session.
 - Dead-but-not-closed sessions are marked `disconnected`.
 
 ## SFTP dual path (important)
@@ -114,7 +114,7 @@ The `TransferCommand` and `ListCommand` structs carry both `ConnectArgs` and opt
 2. **SCP** — simpler protocol via `scp_send`/`scp_recv`; works when SFTP subsystem is disabled.
 3. **exec** — base64 + PowerShell (`[IO.File]::WriteAllBytes` / `[IO.File]::ReadAllBytes`); handles Windows OpenSSH servers where neither SFTP nor SCP is available.
 
-SCP upload requires `wait_eof()` before `wait_close()` to avoid `LIBSSH2_ERROR_CHANNEL_WAIT_CLOSED`. Exec upload is limited to ~22 KB of raw file data (base64-encoded command ≤ 30,000 chars). Use `--method sftp` or `--method scp` to bypass fallback and force a specific protocol.
+SCP upload requires `wait_eof()` before `wait_close()` to avoid channel errors. Exec upload is limited to ~22 KB of raw file data (base64-encoded command ≤ 30,000 chars). Use `--method sftp` or `--method scp` to bypass fallback and force a specific protocol.
 
 ## Proxy (port forwarding & SOCKS5)
 
@@ -123,9 +123,23 @@ SCP upload requires `wait_eof()` before `wait_close()` to avoid `LIBSSH2_ERROR_C
 - **Local port forwarding** (`-L`): `--local <host:port> --remote <host:port>` — listens locally, forwards each connection through `channel_direct_tcpip` to the remote target.
 - **SOCKS5** (`-D`): `--socks5 <host:port>` — local SOCKS5 proxy, every connection performs a SOCKS5 handshake (RFC 1928, no-auth CONNECT only) then tunnels the target through `channel_direct_tcpip`.
 
-Each proxy lives in its own listener thread inside the daemon. Accepted connections spawn per-connection threads that run a non-blocking bidirectional forward loop between the local TCP stream and the SSH direct-tcpip channel. Proxy lifecycle mirrors sessions: `create`/`list`/`ping`/`close` (with `--all`). Each proxy increments the connection refcount on its pooled SSH session.
+Each proxy lives in its own listener task inside the daemon. Accepted connections spawn per-connection async tasks that run a non-blocking bidirectional forward loop between the local TCP stream and the SSH direct-tcpip channel. Proxy lifecycle mirrors sessions: `create`/`list`/`ping`/`close` (with `--all`). Each proxy increments the connection refcount on its pooled SSH session.
 
 On macOS, `TcpListener::set_nonblocking(true)` causes accepted `TcpStream` sockets to inherit the non-blocking flag. The SOCKS5 handshake explicitly sets the stream back to blocking before reading the handshake frames, then switches to non-blocking for the forwarding loop.
+
+## Security
+
+### Host key verification (TOFU)
+
+AgentSSH uses Trust-On-First-Use (TOFU) with `~/.ssh/known_hosts`:
+
+- **First connection**: the server's host key is appended to `known_hosts` automatically.
+- **Subsequent connections**: the key is verified against the stored entry. A mismatch aborts with an error (host key changed).
+- Non-standard ports use the `[host]:port` bracketed format in `known_hosts`.
+
+### Exec fallback shell escaping
+
+When the exec fallback method is used for file operations, commands are constructed with `shell_words::quote()` to safely escape arguments and prevent shell injection.
 
 ## Testing
 
@@ -162,4 +176,3 @@ cargo run -- proxy close --all
 - `anyhow::Result<()>` throughout; errors propagated with `.context()`.
 - Serde derive macros on nearly all command structs — they double as wire format.
 - PTY dimensions default to 120×40 (`util.rs` constants).
-- `ssh.set_blocking(true)` before blocking SFTP operations, restored to `false` after — because the daemon keeps sessions in non-blocking mode for async I/O.

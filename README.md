@@ -69,7 +69,7 @@ agentssh profile list
 
 ```bash
 agentssh --json exec --profile prod --retry 3 -- uptime
-# {"ok":true,"data":{"exit_status":0,"stdout":"21:03:01 up 42 days\n","stderr":""}}
+# {"ok":true,"data":{"exit_code":0,"stdout":"21:03:01 up 42 days\n","stderr":""}}
 ```
 
 Commands run through `/bin/sh -c` — pipes, redirects, and shell chains work natively:
@@ -95,7 +95,7 @@ agentssh connect --profile prod --reconnect
 
 # Clean command execution (no PTY echo — structured JSON)
 agentssh session exec --session-id s1 -- uname -a
-# → {"exit_status":0, "stdout":"Linux ...\n", "stderr":""}
+# → {"exit_code":0, "stdout":"Linux ...\n", "stderr":""}
 
 # Interactive PTY mode
 agentssh session send --session-id s1 --input $'ls -la\n'
@@ -180,7 +180,7 @@ agentssh proxy close --all
 
 **Connection pooling** — sessions can share one TCP/SSH connection. `session spawn --from <id>` opens a fresh PTY on the same underlying connection.
 
-**Proxy threads** — each `proxy create` spawns a listener thread inside the daemon. Accepted connections get their own handler thread with non-blocking bidirectional forwarding.
+**Proxy tasks** — each `proxy create` spawns an async listener task inside the daemon. Accepted connections get their own handler task with non-blocking bidirectional forwarding.
 
 ---
 
@@ -261,6 +261,22 @@ agentssh daemon shutdown               # Stop daemon + cleanup
 cargo build --release
 # → target/release/agentssh
 ```
+
+---
+
+## 🔒 Security
+
+### Host key verification (TOFU)
+
+AgentSSH uses Trust-On-First-Use (TOFU) with `~/.ssh/known_hosts`:
+
+- **First connection**: the server's host key is appended to `known_hosts` automatically.
+- **Subsequent connections**: the key is verified against the stored entry. A mismatch aborts with an error (host key changed).
+- Non-standard ports use the `[host]:port` bracketed format in `known_hosts`.
+
+### Exec fallback shell escaping
+
+When the exec fallback method is used for file operations, commands are constructed with `shell_words::quote()` to safely escape arguments and prevent shell injection.
 
 ---
 

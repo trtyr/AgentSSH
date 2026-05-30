@@ -67,7 +67,7 @@ agentssh profile list
 
 ```bash
 agentssh --json exec --profile prod --retry 3 -- uptime
-# {"ok":true,"data":{"exit_status":0,"stdout":"21:03:01 up 42 days\n","stderr":""}}
+# {"ok":true,"data":{"exit_code":0,"stdout":"21:03:01 up 42 days\n","stderr":""}}
 ```
 
 命令通过 `/bin/sh -c` 执行——管道、重定向、链式命令原生支持：
@@ -93,7 +93,7 @@ agentssh connect --profile prod --reconnect
 
 # 干净命令执行（无 PTY 回显 — 结构化 JSON）
 agentssh session exec --session-id s1 -- uname -a
-# → {"exit_status":0, "stdout":"Linux ...\n", "stderr":""}
+# → {"exit_code":0, "stdout":"Linux ...\n", "stderr":""}
 
 # 交互式 PTY 模式
 agentssh session send --session-id s1 --input $'ls -la\n'
@@ -178,7 +178,7 @@ agentssh proxy close --all
 
 **连接池** — 多个会话可以共享同一条 TCP/SSH 连接。`session spawn --from <id>` 在同一条底层连接上打开新的 PTY 通道。
 
-**代理线程** — 每个 `proxy create` 在守护进程内启动一个监听线程。每个入站连接 spawn 独立的处理线程，使用非阻塞双向转发。
+**代理任务** — 每个 `proxy create` 在守护进程内启动一个异步监听任务。每个入站连接 spawn 独立的处理任务，使用非阻塞双向转发。
 
 ---
 
@@ -263,6 +263,22 @@ agentssh daemon shutdown               # 停止守护进程 + 清理
 cargo build --release
 # → target/release/agentssh
 ```
+
+---
+
+## 🔒 安全
+
+### 主机密钥验证 (TOFU)
+
+AgentSSH 使用 Trust-On-First-Use (TOFU) 机制配合 `~/.ssh/known_hosts`：
+
+- **首次连接**：服务器的主机密钥会自动添加到 `known_hosts`。
+- **后续连接**：密钥会与已存储的条目进行验证。如果密钥不匹配，连接会中止（主机密钥已更改）。
+- 非标准端口使用 `[host]:port` 方括号格式存储在 `known_hosts` 中。
+
+### Exec 回退的 shell 转义
+
+当使用 exec 回退方法进行文件操作时，命令使用 `shell_words::quote()` 进行安全转义，防止 shell 注入。
 
 ---
 
