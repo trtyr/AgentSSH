@@ -1,9 +1,6 @@
-use crate::cli::ConnectArgs;
-use crate::kernel::ServerState;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
@@ -37,96 +34,10 @@ pub struct ProxyState {
 }
 
 // ---------------------------------------------------------------------------
-// Create proxy
+// Listener
 // ---------------------------------------------------------------------------
 
-pub async fn daemon_proxy_create(
-    args: &ConnectArgs,
-    proxy_mode: &ProxyMode,
-    state: &mut ServerState,
-) -> Result<Value> {
-    let resolved = crate::connection::resolve_connect_args(args)?;
-    let (handle, _host, _port, _username) = crate::connection::connect_with_info(&resolved).await?;
-
-    let connection_id = {
-        let entry = state.next_connection_id;
-        state.next_connection_id += 1;
-        format!("c{}", entry)
-    };
-
-    state.connections.insert(
-        connection_id.clone(),
-        crate::connection::SharedConnection {
-            handle: handle.clone(),
-            refcount: 1,
-        },
-    );
-
-    // Determine local bind address
-    let local_addr = match proxy_mode {
-        ProxyMode::LocalForward { local_addr, .. } => local_addr.clone(),
-        ProxyMode::Socks5 { local_addr } => local_addr.clone(),
-    };
-
-    let local_addr_parsed: SocketAddr = local_addr
-        .parse()
-        .with_context(|| format!("parsing local address: {}", local_addr))?;
-
-    let listener = TcpListener::bind(local_addr_parsed)
-        .await
-        .with_context(|| format!("binding to {}", local_addr))?;
-
-    let proxy_id = {
-        let entry = state.next_id;
-        state.next_id += 1;
-        format!("p{}", entry)
-    };
-
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let status = Arc::new(Mutex::new(ProxyStatus::Running));
-    let mode = proxy_mode.clone();
-
-    // Spawn listener task
-    let shutdown_clone = shutdown.clone();
-    let status_clone = status.clone();
-    let proxy_id_clone = proxy_id.clone();
-    let handle_clone = handle;
-    let listener_addr = local_addr.clone();
-
-    tokio::spawn(async move {
-        run_proxy_listener(
-            listener,
-            &listener_addr,
-            &mode,
-            handle_clone,
-            shutdown_clone,
-            status_clone,
-            &proxy_id_clone,
-        )
-        .await;
-    });
-
-    let proxy = ProxyState {
-        id: proxy_id.clone(),
-        connection_id: connection_id.clone(),
-        mode: proxy_mode.clone(),
-        local_addr: local_addr.clone(),
-        status,
-        shutdown,
-    };
-
-    state.proxies.insert(proxy_id.clone(), proxy);
-
-    Ok(json!({
-        "ok": true,
-        "proxy_id": proxy_id,
-        "connection_id": connection_id,
-        "local_addr": local_addr,
-        "mode": serde_json::to_value(proxy_mode)?,
-    }))
-}
-
-async fn run_proxy_listener(
+pub(crate) async fn run_proxy_listener(
     listener: TcpListener,
     _local_addr: &str,
     mode: &ProxyMode,
@@ -335,44 +246,15 @@ pub fn proxy_ping(proxy_id: &str, proxies: &BTreeMap<String, ProxyState>) -> Res
     let proxy = proxies
         .get(proxy_id)
         .ok_or_else(|| anyhow::anyhow!("proxy {} not found", proxy_id))?;
-    let status_str = match &*proxy.status.blocking_lock() {
-        ProxyStatus::Running => "running".to_string(),
-        ProxyStatus::Stopped => "stopped".to_string(),
-        ProxyStatus::Error(e) => e.clone(),
+    let status_str = match proxy.status.try_lock() {
+        Ok(s) => match &*s {
+            ProxyStatus::Running => "running".to_string(),
+            ProxyStatus::Stopped => "stopped".to_string(),
+            ProxyStatus::Error(e) => e.clone(),
+        },
+        Err(_) => "unknown".to_string(),
     };
     Ok(json!({"ok": true, "proxy_id": proxy_id, "status": status_str}))
-}
-
-pub async fn proxy_close(
-    proxy_id: &str,
-    all: bool,
-    state: &mut ServerState,
-) -> Result<Value> {
-    let ids_to_close: Vec<String> = if all {
-        state.proxies.keys().cloned().collect()
-    } else {
-        vec![proxy_id.to_string()]
-    };
-
-    let mut closed = Vec::new();
-    for id in ids_to_close {
-        if let Some(proxy) = state.proxies.remove(&id) {
-            proxy.shutdown.store(true, Ordering::Relaxed);
-            *proxy.status.lock().await = ProxyStatus::Stopped;
-
-            // Decrement connection refcount
-            if let Some(conn) = state.connections.get_mut(&proxy.connection_id) {
-                conn.refcount = conn.refcount.saturating_sub(1);
-                if conn.refcount == 0 {
-                    state.connections.remove(&proxy.connection_id);
-                }
-            }
-
-            closed.push(id);
-        }
-    }
-
-    Ok(json!({"ok": true, "closed": closed}))
 }
 
 // ---------------------------------------------------------------------------
@@ -460,5 +342,89 @@ mod tests {
         let mut proxies = BTreeMap::new();
         let summary = proxy_list(&proxies);
         assert_eq!(summary["proxies"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_proxy_ping_running() {
+        let mut proxies = BTreeMap::new();
+        proxies.insert(
+            "p1".to_string(),
+            ProxyState {
+                id: "p1".into(),
+                connection_id: "c1".into(),
+                mode: ProxyMode::Socks5 { local_addr: "127.0.0.1:1080".into() },
+                local_addr: "127.0.0.1:1080".into(),
+                status: Arc::new(Mutex::new(ProxyStatus::Running)),
+                shutdown: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let result = proxy_ping("p1", &proxies).unwrap();
+        assert_eq!(result["status"], "running");
+        assert_eq!(result["proxy_id"], "p1");
+        assert_eq!(result["ok"], true);
+    }
+
+    #[test]
+    fn test_proxy_ping_stopped() {
+        let mut proxies = BTreeMap::new();
+        proxies.insert(
+            "p1".to_string(),
+            ProxyState {
+                id: "p1".into(),
+                connection_id: "c1".into(),
+                mode: ProxyMode::Socks5 { local_addr: "127.0.0.1:1080".into() },
+                local_addr: "127.0.0.1:1080".into(),
+                status: Arc::new(Mutex::new(ProxyStatus::Stopped)),
+                shutdown: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let result = proxy_ping("p1", &proxies).unwrap();
+        assert_eq!(result["status"], "stopped");
+    }
+
+    #[test]
+    fn test_proxy_ping_error() {
+        let mut proxies = BTreeMap::new();
+        proxies.insert(
+            "p1".to_string(),
+            ProxyState {
+                id: "p1".into(),
+                connection_id: "c1".into(),
+                mode: ProxyMode::Socks5 { local_addr: "127.0.0.1:1080".into() },
+                local_addr: "127.0.0.1:1080".into(),
+                status: Arc::new(Mutex::new(ProxyStatus::Error("bind failed".into()))),
+                shutdown: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let result = proxy_ping("p1", &proxies).unwrap();
+        assert_eq!(result["status"], "bind failed");
+    }
+
+    #[test]
+    fn test_proxy_ping_not_found() {
+        let proxies = BTreeMap::new();
+        let err = proxy_ping("nonexistent", &proxies).unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_proxy_ping_lock_contended() {
+        let mut proxies = BTreeMap::new();
+        let status = Arc::new(Mutex::new(ProxyStatus::Running));
+        proxies.insert(
+            "p1".to_string(),
+            ProxyState {
+                id: "p1".into(),
+                connection_id: "c1".into(),
+                mode: ProxyMode::Socks5 { local_addr: "127.0.0.1:1080".into() },
+                local_addr: "127.0.0.1:1080".into(),
+                status: status.clone(),
+                shutdown: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        // Hold the lock to simulate contention — try_lock() should return Err
+        let _held = status.lock().await;
+        let result = proxy_ping("p1", &proxies).unwrap();
+        assert_eq!(result["status"], "unknown");
     }
 }

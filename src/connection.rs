@@ -1,10 +1,15 @@
 use crate::cli::ConnectArgs;
 use crate::util::{self, DEFAULT_EXEC_TIMEOUT_MS, DEFAULT_PORT};
 use anyhow::{Context, Result, bail};
-use russh::keys::{self, PrivateKeyWithHashAlg};
 use russh::client::AuthResult;
+use russh::keys::{self, PrivateKeyWithHashAlg};
 use russh::MethodSet;
 use russh::{client, Channel, ChannelMsg};
+use std::fs;
+use std::io::ErrorKind;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,19 +17,20 @@ use std::time::Duration;
 // Client handler for russh (host key verification)
 // ---------------------------------------------------------------------------
 
-pub(crate) struct ClientHandler;
+pub(crate) struct ClientHandler {
+    pub host: String,
+    pub port: u16,
+}
 
 impl client::Handler for ClientHandler {
     type Error = anyhow::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &keys::PublicKey,
+        server_public_key: &keys::PublicKey,
     ) -> Result<bool, Self::Error> {
-        // Accept all host keys (same behavior as ssh2 path which used
-        // known_hosts lookup only when explicitly requested — agentssh
-        // currently skips verification).
-        Ok(true)
+        verify_or_trust_host_key(&self.host, self.port, server_public_key)
+            .with_context(|| format!("verifying SSH host key for {}:{}", self.host, self.port))
     }
 }
 
@@ -37,6 +43,205 @@ pub type SharedConnectionHandle = client::Handle<ClientHandler>;
 pub struct SharedConnection {
     pub handle: Arc<SharedConnectionHandle>,
     pub refcount: u32,
+}
+
+// ---------------------------------------------------------------------------
+// known_hosts TOFU verification
+// ---------------------------------------------------------------------------
+
+fn verify_or_trust_host_key(
+    host: &str,
+    port: u16,
+    server_public_key: &keys::PublicKey,
+) -> Result<bool> {
+    let known_hosts_path = known_hosts_path()?;
+    let host_patterns = known_hosts_patterns(host, port);
+
+    let existing = match fs::read_to_string(&known_hosts_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading {}", known_hosts_path.display()));
+        }
+    };
+
+    if known_hosts_has_key(&existing, &host_patterns, server_public_key)? {
+        return Ok(true);
+    }
+
+    append_known_host_atomically(&known_hosts_path, &existing, &host_patterns, server_public_key)?;
+    Ok(true)
+}
+
+fn known_hosts_path() -> Result<PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not locate home directory"))?;
+    Ok(home.join(".ssh").join("known_hosts"))
+}
+
+fn known_hosts_patterns(host: &str, port: u16) -> Vec<String> {
+    if port == DEFAULT_PORT {
+        vec![host.to_string()]
+    } else {
+        vec![format!("[{host}]:{port}")]
+    }
+}
+
+fn known_hosts_has_key(
+    contents: &str,
+    host_patterns: &[String],
+    server_public_key: &keys::PublicKey,
+) -> Result<bool> {
+    let wanted_key = canonical_public_key(server_public_key)?;
+
+    for line in contents.lines() {
+        let Some((patterns, public_key)) = parse_known_hosts_line(line) else {
+            continue;
+        };
+        if !host_patterns.iter().any(|host| patterns_match(&patterns, host)) {
+            continue;
+        }
+
+        let known_key = canonical_public_key(&public_key)?;
+        if known_key == wanted_key {
+            return Ok(true);
+        }
+
+        bail!(
+            "SSH host key mismatch for {}; known_hosts contains a different key",
+            host_patterns.join(",")
+        );
+    }
+
+    Ok(false)
+}
+
+fn parse_known_hosts_line(line: &str) -> Option<(Vec<String>, keys::PublicKey)> {
+    let line = strip_known_hosts_comment(line).trim();
+    if line.is_empty() {
+        return None;
+    }
+
+    let mut parts = line.split_whitespace();
+    let first = parts.next()?;
+    let hosts = if first.starts_with('@') {
+        parts.next()?
+    } else {
+        first
+    };
+    let algorithm = parts.next()?;
+    let key = parts.next()?;
+    let public_key = keys::PublicKey::from_openssh(&format!("{algorithm} {key}")).ok()?;
+
+    Some((hosts.split(',').map(str::to_string).collect(), public_key))
+}
+
+fn strip_known_hosts_comment(line: &str) -> &str {
+    line.split_once('#').map_or(line, |(before_comment, _)| before_comment)
+}
+
+fn patterns_match(patterns: &[String], host: &str) -> bool {
+    let mut matched = false;
+    for pattern in patterns {
+        if let Some(negated) = pattern.strip_prefix('!') {
+            if host_pattern_matches(negated, host) {
+                return false;
+            }
+        } else if host_pattern_matches(pattern, host) {
+            matched = true;
+        }
+    }
+    matched
+}
+
+fn host_pattern_matches(pattern: &str, host: &str) -> bool {
+    if pattern.starts_with("|1|") {
+        // OpenSSH hashed hostnames require HMAC-SHA1 support. AgentSSH preserves
+        // those entries but cannot match them without adding a crypto dependency.
+        return false;
+    }
+    if pattern.contains(['*', '?']) {
+        glob_match(pattern.as_bytes(), host.as_bytes())
+    } else {
+        pattern == host
+    }
+}
+
+fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+    if pattern.is_empty() {
+        return text.is_empty();
+    }
+
+    match pattern[0] {
+        b'*' => glob_match(&pattern[1..], text) || (!text.is_empty() && glob_match(pattern, &text[1..])),
+        b'?' => !text.is_empty() && glob_match(&pattern[1..], &text[1..]),
+        byte => !text.is_empty() && byte == text[0] && glob_match(&pattern[1..], &text[1..]),
+    }
+}
+
+fn append_known_host_atomically(
+    path: &Path,
+    existing: &str,
+    host_patterns: &[String],
+    server_public_key: &keys::PublicKey,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("known_hosts path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    set_secure_dir_permissions(parent)?;
+
+    let mut updated = String::with_capacity(existing.len() + 256);
+    updated.push_str(existing);
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(&host_patterns.join(","));
+    updated.push(' ');
+    updated.push_str(&canonical_public_key(server_public_key)?);
+    updated.push('\n');
+
+    let tmp_path = temporary_known_hosts_path(path);
+    fs::write(&tmp_path, updated).with_context(|| format!("writing {}", tmp_path.display()))?;
+    set_secure_file_permissions(&tmp_path)?;
+    fs::rename(&tmp_path, path)
+        .with_context(|| format!("renaming {} to {}", tmp_path.display(), path.display()))?;
+    set_secure_file_permissions(path)?;
+    Ok(())
+}
+
+fn temporary_known_hosts_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("known_hosts");
+    path.with_file_name(format!(".{file_name}.agentssh.tmp"))
+}
+
+fn canonical_public_key(public_key: &keys::PublicKey) -> Result<String> {
+    let encoded = public_key.to_openssh().context("encoding server public key")?;
+    let mut parts = encoded.split_whitespace();
+    let algorithm = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("encoded public key missing algorithm"))?;
+    let key = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("encoded public key missing key data"))?;
+    Ok(format!("{algorithm} {key}"))
+}
+
+fn set_secure_dir_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("setting permissions on {}", path.display()))?;
+    Ok(())
+}
+
+fn set_secure_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("setting permissions on {}", path.display()))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -66,7 +271,10 @@ pub async fn connect_with_info(
         ..Default::default()
     };
 
-    let handler = ClientHandler;
+    let handler = ClientHandler {
+        host: host.clone(),
+        port,
+    };
     let mut handle = client::connect(Arc::new(config), (host.as_str(), port), handler)
         .await
         .with_context(|| format!("connecting to {}:{}", host, port))?;
@@ -320,7 +528,11 @@ fn passphrase(args: &ConnectArgs) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+
+    const SAMPLE_KEY_A: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti test-a";
+    const SAMPLE_KEY_B: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9dG4kjRhQTtWTVzd2t27+t0DEHBPW7iOD23TUiYLio test-b";
 
     #[test]
     fn merge_connect_args_preserves_retry_fields() {
@@ -359,5 +571,141 @@ mod tests {
         assert_eq!(merged.port, Some(2222));
         assert_eq!(merged.retry, Some(3));
         assert_eq!(merged.retry_delay_ms, Some(500));
+    }
+
+    #[test]
+    fn known_hosts_accepts_matching_default_port_key() {
+        let key = keys::PublicKey::from_openssh(SAMPLE_KEY_A).expect("valid sample key");
+        let known_hosts = "example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti\n";
+
+        let matched = known_hosts_has_key(known_hosts, &known_hosts_patterns("example.com", 22), &key)
+            .expect("lookup succeeds");
+
+        assert!(matched);
+    }
+
+    #[test]
+    fn known_hosts_rejects_changed_key_for_same_host() {
+        let key = keys::PublicKey::from_openssh(SAMPLE_KEY_B).expect("valid sample key");
+        let known_hosts = "example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti\n";
+
+        let error = known_hosts_has_key(known_hosts, &known_hosts_patterns("example.com", 22), &key)
+            .expect_err("mismatched key must fail");
+
+        assert!(error.to_string().contains("host key mismatch"));
+    }
+
+    #[test]
+    fn known_hosts_uses_bracketed_host_for_non_default_port() {
+        let patterns = known_hosts_patterns("example.com", 2222);
+        assert_eq!(patterns, vec!["[example.com]:2222"]);
+    }
+
+    #[test]
+    fn append_known_host_writes_new_line() {
+        let temp_dir = std::env::temp_dir().join(format!("agentssh-test-{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).expect("temp dir");
+        let known_hosts_path = temp_dir.join("known_hosts");
+        let key = keys::PublicKey::from_openssh(SAMPLE_KEY_A).expect("valid sample key");
+
+        append_known_host_atomically(&known_hosts_path, "", &known_hosts_patterns("example.com", 22), &key)
+            .expect("append succeeds");
+
+        let written = fs::read_to_string(&known_hosts_path).expect("known_hosts readable");
+        assert!(written.starts_with("example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti"));
+        assert!(written.ends_with('\n'));
+
+        let _ = fs::remove_file(&known_hosts_path);
+        let _ = fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn known_hosts_returns_none_for_unknown_host() {
+        let key = keys::PublicKey::from_openssh(SAMPLE_KEY_A).expect("valid sample key");
+        let known_hosts = "";
+        let result = known_hosts_has_key(known_hosts, &known_hosts_patterns("unknown.host", 22), &key)
+            .expect("lookup succeeds");
+        assert!(!result, "empty known_hosts should return false (not found)");
+    }
+
+    #[test]
+    fn known_hosts_ignores_hashed_entries() {
+        // |1|<base64salt>|<base64hash> is the OpenSSH hashed-hostname format.
+        // AgentSSH preserves them but cannot match them, so the lookup must
+        // report the host as unknown.
+        let key = keys::PublicKey::from_openssh(SAMPLE_KEY_A).expect("valid sample key");
+        let known_hosts =
+            "|1|c2FsdA==|aGFzaA== ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti hashed-host\n";
+        let result = known_hosts_has_key(
+            known_hosts,
+            &known_hosts_patterns("hashed-host", 22),
+            &key,
+        )
+        .expect("lookup succeeds");
+        assert!(!result, "hashed entries should not be matched");
+    }
+
+    #[test]
+    fn known_hosts_skips_malformed_lines() {
+        let key = keys::PublicKey::from_openssh(SAMPLE_KEY_A).expect("valid sample key");
+        let known_hosts = "\
+# comment line
+
+only-host-no-algo
+example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti ok
+";
+        // The valid line should still be found despite surrounding garbage.
+        let result = known_hosts_has_key(
+            known_hosts,
+            &known_hosts_patterns("example.com", 22),
+            &key,
+        )
+        .expect("lookup succeeds");
+        assert!(result, "valid entry must be found among malformed lines");
+
+        // Lookup for an unrelated host should return false (not panic).
+        let result2 = known_hosts_has_key(
+            known_hosts,
+            &known_hosts_patterns("other.host", 22),
+            &key,
+        )
+        .expect("lookup succeeds");
+        assert!(!result2);
+    }
+
+    #[test]
+    fn known_hosts_multiple_hosts_first_matches() {
+        let key_a = keys::PublicKey::from_openssh(SAMPLE_KEY_A).expect("valid sample key A");
+        let key_b = keys::PublicKey::from_openssh(SAMPLE_KEY_B).expect("valid sample key B");
+        let known_hosts = "\
+host-one ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti first
+host-two ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9dG4kjRhQTtWTVzd2t27+t0DEHBPW7iOD23TUiYLio second
+";
+        // Looking up host-one should match key_a.
+        let result = known_hosts_has_key(
+            known_hosts,
+            &known_hosts_patterns("host-one", 22),
+            &key_a,
+        )
+        .expect("lookup succeeds");
+        assert!(result, "first host must match its key");
+
+        // Looking up host-two with key_a should fail (key mismatch).
+        let err = known_hosts_has_key(
+            known_hosts,
+            &known_hosts_patterns("host-two", 22),
+            &key_a,
+        )
+        .expect_err("wrong key for host-two must error");
+        assert!(err.to_string().contains("host key mismatch"));
+    }
+
+    #[test]
+    fn known_hosts_default_port_uses_plain_hostname() {
+        let patterns = known_hosts_patterns("example.com", 22);
+        assert_eq!(patterns, vec!["example.com"]);
+        // Must NOT produce bracketed form.
+        assert!(!patterns[0].contains('['), "default port should use plain hostname");
+        assert!(!patterns[0].contains(':'), "default port should use plain hostname");
     }
 }

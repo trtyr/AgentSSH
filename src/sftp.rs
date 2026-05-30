@@ -1,59 +1,9 @@
 use crate::cli::*;
 use crate::connection;
-use crate::kernel::ServerState;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
-
-// ---------------------------------------------------------------------------
-// Daemon file operations (routed through daemon, use existing connection)
-// ---------------------------------------------------------------------------
-
-pub async fn daemon_upload(cmd: &TransferCommand, state: &mut ServerState) -> Result<Value> {
-    let handle = get_handle(cmd.session_id.as_deref(), state)?;
-    let local = cmd.local.to_string_lossy();
-    let remote = cmd.remote.to_string_lossy();
-    do_upload(&handle, &local, &remote, &cmd.method).await
-}
-
-pub async fn daemon_download(cmd: &TransferCommand, state: &mut ServerState) -> Result<Value> {
-    let handle = get_handle(cmd.session_id.as_deref(), state)?;
-    let local = cmd.local.to_string_lossy();
-    let remote = cmd.remote.to_string_lossy();
-    do_download(&handle, &local, &remote, &cmd.method).await
-}
-
-pub async fn daemon_ls(cmd: &ListCommand, state: &mut ServerState) -> Result<Value> {
-    let handle = get_handle(cmd.session_id.as_deref(), state)?;
-    let remote = cmd.remote.to_string_lossy();
-    do_ls(&handle, &remote, &cmd.method).await
-}
-
-pub async fn daemon_write_file(cmd: &WriteCommand, state: &mut ServerState) -> Result<Value> {
-    let handle = get_handle(cmd.session_id.as_deref(), state)?;
-    let remote = cmd.remote.to_string_lossy();
-    do_write(&handle, &remote, cmd.content.as_bytes(), &cmd.content.len(), &"auto").await
-}
-
-pub async fn daemon_read_file(cmd: &ReadFileCommand, state: &mut ServerState) -> Result<Value> {
-    let handle = get_handle(cmd.session_id.as_deref(), state)?;
-    let remote = cmd.remote.to_string_lossy();
-    do_read_file(&handle, &remote).await
-}
-
-pub async fn daemon_delete(cmd: &DeleteFileCommand, state: &mut ServerState) -> Result<Value> {
-    let handle = get_handle(cmd.session_id.as_deref(), state)?;
-    let remote = cmd.remote.to_string_lossy();
-    let recursive = cmd.recursive;
-    do_delete(&handle, &remote, recursive).await
-}
-
-pub async fn daemon_edit(cmd: &EditFileCommand, state: &mut ServerState) -> Result<Value> {
-    let handle = get_handle(cmd.session_id.as_deref(), state)?;
-    let remote = cmd.remote.to_string_lossy();
-    do_edit(&handle, &remote, &cmd.find, &cmd.replace).await
-}
 
 // ---------------------------------------------------------------------------
 // One-shot operations (no daemon)
@@ -128,7 +78,7 @@ pub async fn edit_once(cmd: &EditFileCommand, _json: bool) -> Result<()> {
 // Core implementation
 // ---------------------------------------------------------------------------
 
-async fn do_upload(
+pub(crate) async fn do_upload(
     handle: &connection::SharedConnectionHandle,
     local: &str,
     remote: &str,
@@ -157,7 +107,7 @@ async fn do_upload(
     }
 }
 
-async fn do_download(
+pub(crate) async fn do_download(
     handle: &connection::SharedConnectionHandle,
     local: &str,
     remote: &str,
@@ -183,7 +133,7 @@ async fn do_download(
     }
 }
 
-async fn do_ls(
+pub(crate) async fn do_ls(
     handle: &connection::SharedConnectionHandle,
     remote: &str,
     method: &str,
@@ -201,7 +151,7 @@ async fn do_ls(
     }
 }
 
-async fn do_write(
+pub(crate) async fn do_write(
     handle: &connection::SharedConnectionHandle,
     remote: &str,
     content: &[u8],
@@ -227,7 +177,7 @@ async fn do_write(
     }
 }
 
-async fn do_read_file(
+pub(crate) async fn do_read_file(
     handle: &connection::SharedConnectionHandle,
     remote: &str,
 ) -> Result<Value> {
@@ -236,7 +186,7 @@ async fn do_read_file(
     Ok(json!({"ok": true, "path": remote, "content": content, "bytes": data.len()}))
 }
 
-async fn do_delete(
+pub(crate) async fn do_delete(
     handle: &connection::SharedConnectionHandle,
     remote: &str,
     _recursive: bool,
@@ -247,7 +197,7 @@ async fn do_delete(
     }
 }
 
-async fn do_edit(
+pub(crate) async fn do_edit(
     handle: &connection::SharedConnectionHandle,
     remote: &str,
     find: &str,
@@ -383,14 +333,14 @@ async fn exec_upload(
     let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
     let chunk_size = 30000;
     if encoded.len() <= chunk_size {
-        let cmd = format!("echo '{}' | base64 -d > '{}'", encoded, remote);
+        let cmd = format!("echo {} | base64 -d > {}", shell_words::quote(&encoded), shell_words::quote(remote));
         let (_, stderr, exit_code) = exec_remote_command(handle, &cmd).await?;
         if exit_code != 0 {
             bail!("exec upload failed: {}", stderr);
         }
     } else {
         let first = &encoded[..chunk_size];
-        let cmd = format!("echo '{}' | base64 -d > '{}'", first, remote);
+        let cmd = format!("echo {} | base64 -d > {}", shell_words::quote(first), shell_words::quote(remote));
         let (_, stderr, exit_code) = exec_remote_command(handle, &cmd).await?;
         if exit_code != 0 { bail!("exec upload failed: {}", stderr); }
 
@@ -398,7 +348,7 @@ async fn exec_upload(
         while pos < encoded.len() {
             let end = (pos + chunk_size).min(encoded.len());
             let chunk = &encoded[pos..end];
-            let cmd = format!("echo '{}' | base64 -d >> '{}'", chunk, remote);
+            let cmd = format!("echo {} | base64 -d >> {}", shell_words::quote(chunk), shell_words::quote(remote));
             let (_, stderr, exit_code) = exec_remote_command(handle, &cmd).await?;
             if exit_code != 0 { bail!("exec upload chunk failed: {}", stderr); }
             pos = end;
@@ -412,7 +362,7 @@ async fn exec_download(
     local: &str,
     remote: &str,
 ) -> Result<Value> {
-    let cmd = format!("base64 '{}'", remote);
+    let cmd = format!("base64 {}", shell_words::quote(remote));
     let (stdout, stderr, exit_code) = exec_remote_command(handle, &cmd).await?;
     if exit_code != 0 { bail!("exec download failed: {}", stderr); }
 
@@ -429,7 +379,7 @@ async fn exec_ls(
     handle: &connection::SharedConnectionHandle,
     remote: &str,
 ) -> Result<Value> {
-    let cmd = format!("ls -la '{}'", remote);
+    let cmd = format!("ls -la {}", shell_words::quote(remote));
     let (stdout, stderr, exit_code) = exec_remote_command(handle, &cmd).await?;
     if exit_code != 0 { bail!("exec ls failed: {}", stderr); }
 
@@ -448,7 +398,7 @@ async fn exec_write(
     remote: &str,
     base64_content: &str,
 ) -> Result<Value> {
-    let cmd = format!("echo '{}' | base64 -d > '{}'", base64_content, remote);
+    let cmd = format!("echo {} | base64 -d > {}", shell_words::quote(base64_content), shell_words::quote(remote));
     let (_, stderr, exit_code) = exec_remote_command(handle, &cmd).await?;
     if exit_code != 0 { bail!("exec write failed: {}", stderr); }
     Ok(json!({"ok": true, "path": remote, "method": "exec"}))
@@ -458,7 +408,7 @@ async fn exec_delete(
     handle: &connection::SharedConnectionHandle,
     remote: &str,
 ) -> Result<Value> {
-    let cmd = format!("rm -rf '{}'", remote);
+    let cmd = format!("rm -rf {}", shell_words::quote(remote));
     let (_, stderr, exit_code) = exec_remote_command(handle, &cmd).await?;
     if exit_code != 0 { bail!("exec delete failed: {}", stderr); }
     Ok(json!({"ok": true, "deleted": remote, "method": "exec"}))
@@ -467,22 +417,6 @@ async fn exec_delete(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn get_handle(
-    session_id: Option<&str>,
-    state: &ServerState,
-) -> Result<std::sync::Arc<connection::SharedConnectionHandle>> {
-    let sid = session_id.ok_or_else(|| anyhow::anyhow!("session-id required for daemon file operations"))?;
-    let session = state
-        .sessions
-        .get(sid)
-        .ok_or_else(|| anyhow::anyhow!("session {} not found", sid))?;
-    let conn = state
-        .connections
-        .get(&session.connection_id)
-        .ok_or_else(|| anyhow::anyhow!("connection {} not found", session.connection_id))?;
-    Ok(conn.handle.clone())
-}
 
 fn parse_ls_line(line: &str) -> Option<Value> {
     let parts: Vec<&str> = line.split_whitespace().collect();
@@ -494,7 +428,6 @@ fn parse_ls_line(line: &str) -> Option<Value> {
     Some(json!({"name": name, "permissions": perms, "size": size, "is_dir": is_dir}))
 }
 
-/// Resolve ConnectArgs by merging with profile if --profile is specified.
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -526,5 +459,81 @@ mod tests {
         let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
         let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encoded).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    // ---------------------------------------------------------------
+    // Shell quoting regression tests for exec fallback
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_shell_quote_safe_paths_unchanged() {
+        let quoted = shell_words::quote("/tmp/test.txt");
+        assert_eq!(quoted, "/tmp/test.txt");
+    }
+
+    #[test]
+    fn test_shell_quote_single_quotes_escaped() {
+        let input = "it's a file";
+        let quoted = shell_words::quote(input);
+        // The quoted form must not leave a bare single-quote that would
+        // break out of the surrounding shell context.
+        let cmd = format!("echo {} | base64 -d > {}", "dGVzdA==", quoted);
+        assert!(
+            !cmd.contains(&format!("> {}", input)),
+            "raw single-quote input should not appear unquoted in command"
+        );
+    }
+
+    #[test]
+    fn test_shell_quote_semicolons_neutralized() {
+        let input = "file;rm -rf /";
+        let quoted = shell_words::quote(input);
+        let cmd = format!("echo {} | base64 -d > {}", "dGVzdA==", quoted);
+        assert!(
+            !cmd.contains(&format!("> {}", input)),
+            "raw semicolon input should not appear unquoted in command"
+        );
+    }
+
+    #[test]
+    fn test_shell_quote_dollar_signs_neutralized() {
+        let input = "$(whoami)";
+        let quoted = shell_words::quote(input);
+        let cmd = format!("echo {} | base64 -d > {}", "dGVzdA==", quoted);
+        assert!(
+            !cmd.contains(&format!("> {}", input)),
+            "raw $() input should not appear unquoted in command"
+        );
+    }
+
+    #[test]
+    fn test_shell_quote_backticks_neutralized() {
+        let input = "`reboot`";
+        let quoted = shell_words::quote(input);
+        let cmd = format!("echo {} | base64 -d > {}", "dGVzdA==", quoted);
+        assert!(
+            !cmd.contains(&format!("> {}", input)),
+            "raw backtick input should not appear unquoted in command"
+        );
+    }
+
+    #[test]
+    fn test_shell_quote_empty_string() {
+        let quoted = shell_words::quote("");
+        // shell_words::quote wraps empty strings in single quotes: ''
+        assert_eq!(quoted, "''");
+    }
+
+    #[test]
+    fn test_shell_quote_spaces_in_path() {
+        let input = "/path with spaces/file.txt";
+        let quoted = shell_words::quote(input);
+        // Spaces must be quoted; the result should differ from raw input
+        assert_ne!(quoted, input, "spaces in path must be quoted");
+        let cmd = format!("echo {} | base64 -d > {}", "dGVzdA==", quoted);
+        assert!(
+            !cmd.contains(&format!("> {}", input)),
+            "raw spaced path should not appear unquoted in command"
+        );
     }
 }

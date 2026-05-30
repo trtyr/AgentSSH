@@ -1,13 +1,44 @@
-use crate::cli::{ConnectArgs, ConnectCommand, ExpectRespondPair, SpawnCommand};
-use crate::connection::{self, SharedConnection, SharedConnectionHandle};
-use crate::util::{self, now_ms, strip_ansi};
-use anyhow::{Context, Result, bail};
+use crate::cli::ConnectArgs;
+use crate::connection::SharedConnectionHandle;
+use crate::util::{now_ms, strip_ansi};
+use anyhow::{Context, Result};
 use russh::{client, Channel, ChannelMsg};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tokio::sync::mpsc;
+
+// ---------------------------------------------------------------------------
+// Session status — type-safe enum
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionStatus {
+    Running,
+    Exited,
+    Closed,
+    Disconnected,
+    Error(String),
+}
+
+impl serde::Serialize for SessionStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl std::fmt::Display for SessionStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Running => write!(f, "running"),
+            Self::Exited => write!(f, "exited"),
+            Self::Closed => write!(f, "closed"),
+            Self::Disconnected => write!(f, "disconnected"),
+            Self::Error(msg) => write!(f, "error: {}", msg),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -82,7 +113,7 @@ pub struct SessionHandle {
 
     // Shared state with drain task
     pub output: Arc<Mutex<OutputBuffer>>,
-    pub status: Arc<Mutex<String>>,
+    pub status: Arc<Mutex<SessionStatus>>,
     pub exit_status: Arc<Mutex<Option<i32>>>,
     pub exit_signal: Arc<Mutex<Option<String>>>,
 
@@ -112,7 +143,7 @@ impl SessionHandle {
             "host": self.host,
             "port": self.port,
             "username": self.username,
-            "status": *status,
+            "status": (*status).to_string(),
             "output_size": buf.data.len(),
             "exit_status": *exit_status,
             "exit_signal": exit_signal.as_deref().unwrap_or(""),
@@ -133,7 +164,7 @@ impl SessionHandle {
 pub async fn spawn_drain_task(
     channel: Channel<client::Msg>,
     output: Arc<Mutex<OutputBuffer>>,
-    status: Arc<Mutex<String>>,
+    status: Arc<Mutex<SessionStatus>>,
     exit_status: Arc<Mutex<Option<i32>>>,
     exit_signal: Arc<Mutex<Option<String>>>,
     drain_dead: Arc<Mutex<bool>>,
@@ -142,7 +173,7 @@ pub async fn spawn_drain_task(
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
 
     tokio::spawn(async move {
-        *status.lock().unwrap() = "running".to_string();
+        *status.lock().unwrap() = SessionStatus::Running;
         let mut channel = channel;
 
         loop {
@@ -159,7 +190,7 @@ pub async fn spawn_drain_task(
                         }
                         Some(ChannelMsg::ExitStatus { exit_status: code }) => {
                             *exit_status.lock().unwrap() = Some(code as i32);
-                            *status.lock().unwrap() = "exited".to_string();
+                            *status.lock().unwrap() = SessionStatus::Exited;
                             *updated_at.lock().unwrap() = now_ms();
                         }
                         Some(ChannelMsg::ExitSignal { signal_name, error_message, .. }) => {
@@ -179,7 +210,7 @@ pub async fn spawn_drain_task(
                                 russh::Sig::Custom(s) => s,
                             };
                             *exit_signal.lock().unwrap() = Some(sig_str.to_string());
-                            *status.lock().unwrap() = "exited".to_string();
+                            *status.lock().unwrap() = SessionStatus::Exited;
                             if !error_message.is_empty() {
                                 let msg = format!("\r\n[signal: {}]\r\n", error_message);
                                 output.lock().unwrap().extend(msg.as_bytes());
@@ -188,16 +219,16 @@ pub async fn spawn_drain_task(
                         }
                         Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => {
                             let current = status.lock().unwrap().clone();
-                            if current != "exited" {
-                                *status.lock().unwrap() = "closed".to_string();
+                            if current != SessionStatus::Exited {
+                                *status.lock().unwrap() = SessionStatus::Closed;
                             }
                             *updated_at.lock().unwrap() = now_ms();
                             break;
                         }
                         None => {
                             let current = status.lock().unwrap().clone();
-                            if current == "running" {
-                                *status.lock().unwrap() = "closed".to_string();
+                            if current == SessionStatus::Running {
+                                *status.lock().unwrap() = SessionStatus::Closed;
                             }
                             break;
                         }
@@ -208,7 +239,7 @@ pub async fn spawn_drain_task(
                     match cmd {
                         Some(SessionCmd::Send { data }) => {
                             if let Err(e) = channel.data(&data[..]).await {
-                                *status.lock().unwrap() = format!("error: {}", e);
+                                *status.lock().unwrap() = SessionStatus::Error(e.to_string());
                                 break;
                             }
                         }
@@ -222,7 +253,7 @@ pub async fn spawn_drain_task(
                                 "TSTP" => { let _ = channel.data(&b"\x1a"[..]).await; }
                                 "TERM" | "KILL" => {
                                     let _ = channel.eof().await;
-                                    *status.lock().unwrap() = "closed".to_string();
+                                    *status.lock().unwrap() = SessionStatus::Closed;
                                     break;
                                 }
                                 _ => {}
@@ -230,7 +261,7 @@ pub async fn spawn_drain_task(
                         }
                         Some(SessionCmd::Close) => {
                             let _ = channel.eof().await;
-                            *status.lock().unwrap() = "closed".to_string();
+                            *status.lock().unwrap() = SessionStatus::Closed;
                             break;
                         }
                         None => break,
@@ -275,284 +306,6 @@ pub async fn open_pty(
 // ---------------------------------------------------------------------------
 // Daemon session operations
 // ---------------------------------------------------------------------------
-
-pub async fn daemon_connect(
-    cmd: &ConnectCommand,
-    state: &mut crate::kernel::ServerState,
-) -> Result<Value> {
-    let resolved = connection::resolve_connect_args(&cmd.connect)?;
-    let (handle, host, port, username) = connection::connect_with_info(&resolved).await?;
-
-    let channel = open_pty(&handle, cmd.cols, cmd.rows).await?;
-
-    let connection_id = {
-        let entry = state.next_connection_id;
-        state.next_connection_id += 1;
-        format!("c{}", entry)
-    };
-
-    state.connections.insert(
-        connection_id.clone(),
-        SharedConnection {
-            handle: handle.clone(),
-            refcount: 1,
-        },
-    );
-
-    let session_id = {
-        let entry = state.next_id;
-        state.next_id += 1;
-        format!("s{}", entry)
-    };
-
-    let output = Arc::new(Mutex::new(OutputBuffer::default()));
-    let status = Arc::new(Mutex::new("running".to_string()));
-    let exit_status = Arc::new(Mutex::new(None));
-    let exit_signal = Arc::new(Mutex::new(None));
-    let drain_dead = Arc::new(Mutex::new(false));
-    let updated_at = Arc::new(Mutex::new(now_ms()));
-
-    let cmd_tx = spawn_drain_task(
-        channel,
-        output.clone(),
-        status.clone(),
-        exit_status.clone(),
-        exit_signal.clone(),
-        drain_dead.clone(),
-        updated_at.clone(),
-    )
-    .await;
-
-    let session = SessionHandle {
-        id: session_id.clone(),
-        connection_id: connection_id.clone(),
-        host,
-        port,
-        username,
-        cols: cmd.cols,
-        rows: cmd.rows,
-        reconnect: cmd.reconnect,
-        connect_args: resolved,
-        created_at: now_ms(),
-        updated_at,
-        output,
-        status,
-        exit_status,
-        exit_signal,
-        cmd_tx,
-        drain_dead,
-    };
-
-    let summary = session.summary(&BTreeMap::new());
-    state.sessions.insert(session_id.clone(), session);
-
-    Ok(json!({"ok": true, "session_id": session_id, "connection_id": connection_id, "session": summary}))
-}
-
-pub async fn daemon_spawn(
-    cmd: &SpawnCommand,
-    state: &mut crate::kernel::ServerState,
-) -> Result<Value> {
-    let source = state
-        .sessions
-        .get(&cmd.from)
-        .ok_or_else(|| anyhow::anyhow!("session {} not found", cmd.from))?;
-
-    let connection_id = source.connection_id.clone();
-    let host = source.host.clone();
-    let port = source.port;
-    let username = source.username.clone();
-    let connect_args = source.connect_args.clone();
-
-    let conn = state
-        .connections
-        .get_mut(&connection_id)
-        .ok_or_else(|| anyhow::anyhow!("connection {} not found", connection_id))?;
-
-    let c = cmd.cols;
-    let r = cmd.rows;
-    let channel = open_pty(&conn.handle, c, r).await?;
-    conn.refcount += 1;
-
-    let new_id = {
-        let entry = state.next_id;
-        state.next_id += 1;
-        format!("s{}", entry)
-    };
-
-    let output = Arc::new(Mutex::new(OutputBuffer::default()));
-    let status = Arc::new(Mutex::new("running".to_string()));
-    let exit_status = Arc::new(Mutex::new(None));
-    let exit_signal = Arc::new(Mutex::new(None));
-    let drain_dead = Arc::new(Mutex::new(false));
-    let updated_at = Arc::new(Mutex::new(now_ms()));
-
-    let cmd_tx = spawn_drain_task(
-        channel,
-        output.clone(),
-        status.clone(),
-        exit_status.clone(),
-        exit_signal.clone(),
-        drain_dead.clone(),
-        updated_at.clone(),
-    )
-    .await;
-
-    let session = SessionHandle {
-        id: new_id.clone(),
-        connection_id: connection_id.clone(),
-        host,
-        port,
-        username,
-        cols: c,
-        rows: r,
-        reconnect: false,
-        connect_args,
-        created_at: now_ms(),
-        updated_at,
-        output,
-        status,
-        exit_status,
-        exit_signal,
-        cmd_tx,
-        drain_dead,
-    };
-
-    let summary = session.summary(&BTreeMap::new());
-    state.sessions.insert(new_id.clone(), session);
-
-    Ok(json!({"ok": true, "session_id": new_id, "connection_id": connection_id, "session": summary}))
-}
-
-pub async fn daemon_exec(
-    session_id: &str,
-    cmd: &str,
-    timeout_ms: Option<u64>,
-    state: &mut crate::kernel::ServerState,
-) -> Result<Value> {
-    let session = state
-        .sessions
-        .get(session_id)
-        .ok_or_else(|| anyhow::anyhow!("session {} not found", session_id))?;
-
-    let conn = state
-        .connections
-        .get(&session.connection_id)
-        .ok_or_else(|| anyhow::anyhow!("connection {} not found", session.connection_id))?;
-
-    let mut channel = conn
-        .handle
-        .channel_open_session()
-        .await
-        .context("opening exec channel")?;
-
-    let (stdout, stderr, exit_code) =
-        connection::exec_channel(&mut channel, cmd, timeout_ms).await?;
-
-    Ok(json!({"ok": true, "stdout": stdout, "stderr": stderr, "exit_code": exit_code}))
-}
-
-pub async fn daemon_send(
-    session_id: &str,
-    input: &str,
-    crlf: bool,
-    expect_pairs: Vec<ExpectRespondPair>,
-    wait_ms: Option<u64>,
-    wait_idle: Option<u64>,
-    wait_for_exit: bool,
-    state: &mut crate::kernel::ServerState,
-) -> Result<Value> {
-    let session = state
-        .sessions
-        .get_mut(session_id)
-        .ok_or_else(|| anyhow::anyhow!("session {} not found", session_id))?;
-
-    let normalized = normalize_input(input, crlf);
-
-    session
-        .cmd_tx
-        .send(SessionCmd::Send { data: normalized.into_bytes() })
-        .map_err(|_| anyhow::anyhow!("drain task dead"))?;
-
-    if let Some(ms) = wait_ms {
-        tokio::time::sleep(Duration::from_millis(ms)).await;
-    }
-
-    if let Some(idle_ms) = wait_idle {
-        tokio::time::sleep(Duration::from_millis(idle_ms)).await;
-    }
-
-    for pair in expect_pairs {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let matches = {
-                let buf = session.output.lock().unwrap();
-                let haystack = String::from_utf8_lossy(&buf.data);
-                output_matches_str(&haystack, &pair.expect)?
-            };
-            if matches {
-                let normalized_resp = normalize_input(&pair.respond, true);
-                session
-                    .cmd_tx
-                    .send(SessionCmd::Send { data: normalized_resp.into_bytes() })
-                    .map_err(|_| anyhow::anyhow!("drain task dead"))?;
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                bail!("timeout waiting for expect pattern: {}", pair.expect);
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-
-    if wait_for_exit {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        loop {
-            let done = {
-                let st = session.status.lock().unwrap();
-                &*st != "running"
-            };
-            if done { break; }
-            if tokio::time::Instant::now() >= deadline { break; }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-
-    let session = state.sessions.get(session_id).unwrap();
-    let output_val = session.page_output(0, util::DEFAULT_LIMIT, true);
-    let status = session.status.lock().unwrap().clone();
-    let exit_status = *session.exit_status.lock().unwrap();
-    let exit_signal = session.exit_signal.lock().unwrap().clone();
-
-    Ok(daemon_output_response(session_id, &output_val, &status, exit_status, exit_signal))
-}
-
-pub async fn daemon_read(
-    session_id: &str,
-    offset: usize,
-    limit: usize,
-    wait_ms: Option<u64>,
-    strip: Option<bool>,
-    state: &mut crate::kernel::ServerState,
-) -> Result<Value> {
-    let session = state
-        .sessions
-        .get(session_id)
-        .ok_or_else(|| anyhow::anyhow!("session {} not found", session_id))?;
-
-    if let Some(ms) = wait_ms {
-        tokio::time::sleep(Duration::from_millis(ms)).await;
-    }
-
-    let do_strip = strip.unwrap_or(true);
-    let output_val = session.page_output(offset, limit, do_strip);
-    let status = session.status.lock().unwrap().clone();
-    let exit_status = *session.exit_status.lock().unwrap();
-    let exit_signal = session.exit_signal.lock().unwrap().clone();
-
-    Ok(daemon_output_response(session_id, &output_val, &status, exit_status, exit_signal))
-}
 
 pub async fn daemon_resize(
     session_id: &str,
@@ -640,7 +393,7 @@ pub async fn daemon_ping(
         .ok_or_else(|| anyhow::anyhow!("session {} not found", session_id))?;
 
     let alive = !*session.drain_dead.lock().unwrap()
-        && *session.status.lock().unwrap() == "running";
+        && *session.status.lock().unwrap() == SessionStatus::Running;
 
     Ok(json!({"ok": true, "alive": alive, "session_id": session_id}))
 }
@@ -672,7 +425,7 @@ pub fn shared_with_ids(
 pub fn daemon_output_response(
     session_id: &str,
     output: &Value,
-    status: &str,
+    status: &SessionStatus,
     exit_status: Option<i32>,
     exit_signal: Option<String>,
 ) -> Value {
@@ -680,13 +433,13 @@ pub fn daemon_output_response(
         "ok": true,
         "session_id": session_id,
         "output": output,
-        "status": status,
+        "status": status.to_string(),
         "exit_status": exit_status,
         "exit_signal": exit_signal.unwrap_or_default(),
     })
 }
 
-fn output_matches_str(haystack: &str, pattern: &str) -> Result<bool> {
+pub(crate) fn output_matches_str(haystack: &str, pattern: &str) -> Result<bool> {
     use regex::RegexBuilder;
     let haystack_lower = haystack.to_lowercase();
     let pattern_lower = pattern.to_lowercase();
@@ -694,5 +447,76 @@ fn output_matches_str(haystack: &str, pattern: &str) -> Result<bool> {
     match regex {
         Ok(compiled) => Ok(compiled.is_match(haystack) || haystack_lower.contains(&pattern_lower)),
         Err(_) => Ok(haystack_lower.contains(&pattern_lower)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Display trait tests
+    #[test]
+    fn session_status_display_running() {
+        assert_eq!(SessionStatus::Running.to_string(), "running");
+    }
+
+    #[test]
+    fn session_status_display_exited() {
+        assert_eq!(SessionStatus::Exited.to_string(), "exited");
+    }
+
+    #[test]
+    fn session_status_display_closed() {
+        assert_eq!(SessionStatus::Closed.to_string(), "closed");
+    }
+
+    #[test]
+    fn session_status_display_disconnected() {
+        assert_eq!(SessionStatus::Disconnected.to_string(), "disconnected");
+    }
+
+    #[test]
+    fn session_status_display_error() {
+        assert_eq!(SessionStatus::Error("timeout".into()).to_string(), "error: timeout");
+    }
+
+    // Serialize tests — JSON output must be plain string, not object
+    #[test]
+    fn session_status_serialize_running() {
+        let json = serde_json::to_string(&SessionStatus::Running).unwrap();
+        assert_eq!(json, "\"running\"");
+    }
+
+    #[test]
+    fn session_status_serialize_error() {
+        let json = serde_json::to_string(&SessionStatus::Error("killed".into())).unwrap();
+        assert_eq!(json, "\"error: killed\"");
+    }
+
+    // Deserialize tests — roundtrip
+    #[test]
+    fn session_status_deserialize_roundtrip() {
+        for status in [SessionStatus::Running, SessionStatus::Exited, SessionStatus::Closed, SessionStatus::Disconnected] {
+            let json = serde_json::to_string(&status).unwrap();
+            let deserialized: SessionStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, status);
+        }
+    }
+
+    // PartialEq
+    #[test]
+    fn session_status_equality() {
+        assert_eq!(SessionStatus::Running, SessionStatus::Running);
+        assert_ne!(SessionStatus::Running, SessionStatus::Exited);
+        assert_eq!(SessionStatus::Error("x".into()), SessionStatus::Error("x".into()));
+        assert_ne!(SessionStatus::Error("x".into()), SessionStatus::Error("y".into()));
+    }
+
+    // Clone
+    #[test]
+    fn session_status_clone() {
+        let original = SessionStatus::Error("test".into());
+        let cloned = original.clone();
+        assert_eq!(original, cloned);
     }
 }
