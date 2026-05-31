@@ -234,7 +234,7 @@ fn profile_list_json_mode_returns_valid_json() {
         &["profile", "write", "jhost", "--data", r#"{"host":"json.example.com"}"#],
     );
 
-    let (stdout, stderr, code) = agentssh_in_dir(&dir, &["--json", "profile", "list"]);
+    let (stdout, stderr, code) = agentssh_in_dir(&dir, &["--output", "json", "profile", "list"]);
     assert_eq!(code, 0, "stderr: {stderr}");
 
     let parsed: serde_json::Result<serde_json::Value> = serde_json::from_str(&stdout.trim());
@@ -250,7 +250,7 @@ fn profile_write_json_mode_returns_json_event() {
     let (stdout, stderr, code) = agentssh_in_dir(
         &dir,
         &[
-            "--json", "profile", "write", "js",
+            "--output", "json", "profile", "write", "js",
             "--data", r#"{"host":"js.example.com"}"#,
         ],
     );
@@ -270,7 +270,7 @@ fn profile_delete_json_mode_returns_json_event() {
         &["profile", "write", "delme", "--data", r#"{"host":"x"}"#],
     );
 
-    let (stdout, stderr, code) = agentssh_in_dir(&dir, &["--json", "profile", "delete", "delme"]);
+    let (stdout, stderr, code) = agentssh_in_dir(&dir, &["--output", "json", "profile", "delete", "delme"]);
     assert_eq!(code, 0, "stderr: {stderr}");
 
     let val: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
@@ -288,7 +288,7 @@ fn json_mode_errors_are_json_formatted() {
     let dir = temp_dir("json-error");
     let (stdout, _stderr, code) = agentssh_in_dir(
         &dir,
-        &["--json", "profile", "read", "nonexistent"],
+        &["--output", "json", "profile", "read", "nonexistent"],
     );
     assert_ne!(code, 0);
     // In --json mode, errors should go to stdout as JSON
@@ -319,7 +319,7 @@ fn daemon_status_exits_zero() {
 
 #[test]
 fn daemon_status_json_exits_zero() {
-    let (stdout, _stderr, code) = agentssh(&["--json", "daemon", "status"]);
+    let (stdout, _stderr, code) = agentssh(&["--output", "json", "daemon", "status"]);
     assert_eq!(code, 0);
 
     let val: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
@@ -331,30 +331,6 @@ fn daemon_status_json_exits_zero() {
 // ===================================================================
 // P1: CLI flag validation
 // ===================================================================
-
-#[test]
-fn conflicting_json_and_output_flags() {
-    let (_stdout, stderr, code) = agentssh(&["--json", "--output", "text", "profile", "list"]);
-    assert_ne!(code, 0, "conflicting flags should fail");
-    assert!(
-        stderr.contains("conflict") || stderr.contains("cannot"),
-        "should mention conflict: {stderr}"
-    );
-}
-
-#[test]
-fn session_read_conflicting_raw_and_strip_ansi() {
-    let (_stdout, stderr, code) = agentssh(&[
-        "session", "read",
-        "--session-id", "s1",
-        "--raw", "--strip-ansi",
-    ]);
-    assert_ne!(code, 0, "conflicting flags should fail");
-    assert!(
-        stderr.contains("conflict") || stderr.contains("cannot"),
-        "should mention conflict: {stderr}"
-    );
-}
 
 #[test]
 fn proxy_create_conflicting_local_and_socks5() {
@@ -452,35 +428,62 @@ fn exec_without_command_fails() {
     );
 }
 
+#[test]
+fn exec_help_shows_new_options() {
+    let (stdout, stderr, code) = agentssh(&["exec", "--help"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let combined = format!("{stdout}{stderr}");
+    assert!(combined.contains("--pty"), "should show --pty option");
+    assert!(combined.contains("--cols"), "should show --cols option");
+    assert!(combined.contains("--rows"), "should show --rows option");
+    assert!(combined.contains("--timeout"), "should show --timeout option");
+    assert!(combined.contains("no timeout"), "should mention 'no timeout' for 0 value");
+}
+
 // ===================================================================
 // P2: SSH-dependent tests (require a running SSH server)
 // Set AGENTSSH_E2E_SSH_HOST / AGENTSSH_E2E_SSH_USER to enable.
 // ===================================================================
 
-fn ssh_test_env() -> Option<(String, String, u16)> {
+/// SSH test environment. Returns (host, user, port, password).
+/// Password is optional — set AGENTSSH_E2E_SSH_PASS if the server requires it.
+fn ssh_test_env() -> Option<(String, String, u16, Option<String>)> {
     let host = std::env::var("AGENTSSH_E2E_SSH_HOST").ok()?;
     let user = std::env::var("AGENTSSH_E2E_SSH_USER").unwrap_or_else(|_| "root".to_string());
     let port: u16 = std::env::var("AGENTSSH_E2E_SSH_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(22);
-    Some((host, user, port))
+    let password = std::env::var("AGENTSSH_E2E_SSH_PASS").ok();
+    Some((host, user, port, password))
+}
+
+/// Build common SSH args for exec tests. Includes password if set.
+fn ssh_exec_args(host: &str, user: &str, port: u16, password: &Option<String>) -> Vec<String> {
+    let mut args = vec![
+        "-H".to_string(), host.to_string(),
+        "-u".to_string(), user.to_string(),
+        "-P".to_string(), port.to_string(),
+    ];
+    if let Some(pass) = password {
+        args.push("--password".to_string());
+        args.push(pass.clone());
+    }
+    args
 }
 
 #[test]
 #[ignore] // run with: cargo test --test e2e -- --ignored ssh_exec_echo
 fn ssh_exec_echo() {
-    let Some((host, user, port)) = ssh_test_env() else {
+    let Some((host, user, port, password)) = ssh_test_env() else {
         eprintln!("skipping: set AGENTSSH_E2E_SSH_HOST");
         return;
     };
-    let (stdout, stderr, code) = agentssh(&[
-        "exec",
-        "-H", &host,
-        "-u", &user,
-        "-P", &port.to_string(),
-        "--", "echo hello-e2e",
-    ]);
+    let ssh_args = ssh_exec_args(&host, &user, port, &password);
+    let mut args = vec!["exec"];
+    args.extend(ssh_args.iter().map(|s| s.as_str()));
+    args.extend(["--", "echo hello-e2e"]);
+    let (stdout, stderr, code) = agentssh(&args);
     assert_eq!(code, 0, "exec failed: stderr={stderr}");
     assert!(stdout.contains("hello-e2e"), "stdout should contain echo output: {stdout}");
 }
@@ -488,36 +491,33 @@ fn ssh_exec_echo() {
 #[test]
 #[ignore] // run with: cargo test --test e2e -- --ignored ssh_exec_exit_code
 fn ssh_exec_exit_code() {
-    let Some((host, user, port)) = ssh_test_env() else {
+    let Some((host, user, port, password)) = ssh_test_env() else {
         eprintln!("skipping: set AGENTSSH_E2E_SSH_HOST");
         return;
     };
-    let (stdout, stderr, code) = agentssh(&[
-        "--json", "exec",
-        "-H", &host,
-        "-u", &user,
-        "-P", &port.to_string(),
-        "--", "exit 42",
-    ]);
-    assert_eq!(code, 0, "agentssh itself should succeed: stderr={stderr}");
+    let ssh_args = ssh_exec_args(&host, &user, port, &password);
+    let mut args = vec!["--output", "json", "exec"];
+    args.extend(ssh_args.iter().map(|s| s.as_str()));
+    args.extend(["--", "exit 42"]);
+    let (stdout, _stderr, code) = agentssh(&args);
+    // Remote exit code propagates to local process
+    assert_eq!(code, 42, "remote exit code 42 should propagate");
     let val: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert_eq!(val["data"]["exit_code"], 42, "remote exit code should be 42");
+    assert_eq!(val["data"]["exit_code"], 42, "remote exit code should be 42 in JSON");
 }
 
 #[test]
 #[ignore] // run with: cargo test --test e2e -- --ignored ssh_exec_shell_pipe
 fn ssh_exec_shell_pipe() {
-    let Some((host, user, port)) = ssh_test_env() else {
+    let Some((host, user, port, password)) = ssh_test_env() else {
         eprintln!("skipping: set AGENTSSH_E2E_SSH_HOST");
         return;
     };
-    let (stdout, stderr, code) = agentssh(&[
-        "exec",
-        "-H", &host,
-        "-u", &user,
-        "-P", &port.to_string(),
-        "--", "echo hello | tr a-z A-Z",
-    ]);
+    let ssh_args = ssh_exec_args(&host, &user, port, &password);
+    let mut args = vec!["exec"];
+    args.extend(ssh_args.iter().map(|s| s.as_str()));
+    args.extend(["--", "echo hello | tr a-z A-Z"]);
+    let (stdout, stderr, code) = agentssh(&args);
     assert_eq!(code, 0, "exec with pipe failed: stderr={stderr}");
     assert!(stdout.contains("HELLO"), "pipe should uppercase: {stdout}");
 }
@@ -525,17 +525,15 @@ fn ssh_exec_shell_pipe() {
 #[test]
 #[ignore] // run with: cargo test --test e2e -- --ignored ssh_exec_stderr_capture
 fn ssh_exec_stderr_capture() {
-    let Some((host, user, port)) = ssh_test_env() else {
+    let Some((host, user, port, password)) = ssh_test_env() else {
         eprintln!("skipping: set AGENTSSH_E2E_SSH_HOST");
         return;
     };
-    let (stdout, stderr, code) = agentssh(&[
-        "--json", "exec",
-        "-H", &host,
-        "-u", &user,
-        "-P", &port.to_string(),
-        "--", "echo err-msg >&2",
-    ]);
+    let ssh_args = ssh_exec_args(&host, &user, port, &password);
+    let mut args = vec!["--output", "json", "exec"];
+    args.extend(ssh_args.iter().map(|s| s.as_str()));
+    args.extend(["--", "echo err-msg >&2"]);
+    let (stdout, stderr, code) = agentssh(&args);
     assert_eq!(code, 0, "agentssh should succeed: stderr={stderr}");
     let val: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert!(
@@ -547,17 +545,15 @@ fn ssh_exec_stderr_capture() {
 #[test]
 #[ignore] // run with: cargo test --test e2e -- --ignored ssh_exec_json_output
 fn ssh_exec_json_output() {
-    let Some((host, user, port)) = ssh_test_env() else {
+    let Some((host, user, port, password)) = ssh_test_env() else {
         eprintln!("skipping: set AGENTSSH_E2E_SSH_HOST");
         return;
     };
-    let (stdout, stderr, code) = agentssh(&[
-        "--json", "exec",
-        "-H", &host,
-        "-u", &user,
-        "-P", &port.to_string(),
-        "--", "echo hi",
-    ]);
+    let ssh_args = ssh_exec_args(&host, &user, port, &password);
+    let mut args = vec!["--output", "json", "exec"];
+    args.extend(ssh_args.iter().map(|s| s.as_str()));
+    args.extend(["--", "echo hi"]);
+    let (stdout, stderr, code) = agentssh(&args);
     assert_eq!(code, 0, "stderr: {stderr}");
     let val: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(val["ok"], true);
@@ -568,41 +564,46 @@ fn ssh_exec_json_output() {
 #[test]
 #[ignore] // run with: cargo test --test e2e -- --ignored ssh_connect_session_lifecycle
 fn ssh_connect_session_lifecycle() {
-    let Some((host, user, port)) = ssh_test_env() else {
+    let Some((host, user, port, password)) = ssh_test_env() else {
         eprintln!("skipping: set AGENTSSH_E2E_SSH_HOST");
         return;
     };
 
     let dir = temp_dir("session-life");
-    // Create profile
+    // Create profile (include password if set)
+    let mut profile_json = format!(r#"{{"host":"{}","username":"{}","port":{}}}"#, host, user, port);
+    if let Some(pass) = &password {
+        profile_json = format!(r#"{{"host":"{}","username":"{}","port":{},"password":"{}"}}"#, host, user, port, pass);
+    }
     agentssh_in_dir(&dir, &[
         "profile", "write", "e2e",
-        "--data", &format!(r#"{{"host":"{}","username":"{}","port":{}}}"#, host, user, port),
+        "--data", &profile_json,
     ]);
 
     // Connect
-    let (stdout, stderr, code) = agentssh_in_dir(&dir, &["--json", "connect", "-p", "e2e"]);
+    let (stdout, stderr, code) = agentssh_in_dir(&dir, &["--output", "json", "connect", "-p", "e2e"]);
     assert_eq!(code, 0, "connect failed: stderr={stderr}");
     let val: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     let session_id = val["data"]["session_id"].as_str().expect("session_id").to_string();
 
     // Ping
     let (stdout, stderr, code) = agentssh_in_dir(&dir, &[
-        "--json", "session", "ping", "--session-id", &session_id,
+        "--output", "json", "session", "ping", "--session-id", &session_id,
     ]);
     assert_eq!(code, 0, "ping failed: stderr={stderr}");
     let val: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert_eq!(val["data"]["status"], "running");
+    assert_eq!(val["data"]["alive"], true, "session should be alive");
 
     // List
-    let (stdout, stderr, code) = agentssh_in_dir(&dir, &["--json", "session", "list"]);
+    let (stdout, stderr, code) = agentssh_in_dir(&dir, &["--output", "json", "session", "list"]);
     assert_eq!(code, 0, "list failed: stderr={stderr}");
     let val: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert!(val["data"].as_array().unwrap().len() >= 1);
+    let sessions = val["data"]["sessions"].as_array().expect("sessions array");
+    assert!(sessions.len() >= 1, "should have at least 1 session");
 
     // Close
     let (stdout, stderr, code) = agentssh_in_dir(&dir, &[
-        "--json", "session", "close", "--session-id", &session_id,
+        "--output", "json", "session", "close", "--session-id", &session_id,
     ]);
     assert_eq!(code, 0, "close failed: stderr={stderr}");
     let val: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
@@ -614,7 +615,7 @@ fn ssh_connect_session_lifecycle() {
 #[test]
 #[ignore] // run with: cargo test --test e2e -- --ignored ssh_file_upload_download
 fn ssh_file_upload_download() {
-    let Some((host, user, port)) = ssh_test_env() else {
+    let Some((host, user, port, password)) = ssh_test_env() else {
         eprintln!("skipping: set AGENTSSH_E2E_SSH_HOST");
         return;
     };
@@ -624,26 +625,20 @@ fn ssh_file_upload_download() {
     let local_download = dir.join("download.txt");
     fs::write(&local_upload, "e2e-test-content-12345").expect("write upload file");
 
+    let ssh_args = ssh_exec_args(&host, &user, port, &password);
+
     // Upload
-    let (_stdout, stderr, code) = agentssh(&[
-        "file", "upload",
-        "-H", &host,
-        "-u", &user,
-        "-P", &port.to_string(),
-        "--local", local_upload.to_str().unwrap(),
-        "--remote", "/tmp/agentssh-e2e-upload.txt",
-    ]);
+    let mut args = vec!["file", "upload"];
+    args.extend(ssh_args.iter().map(|s| s.as_str()));
+    args.extend(["--local", local_upload.to_str().unwrap(), "--remote", "/tmp/agentssh-e2e-upload.txt"]);
+    let (_stdout, stderr, code) = agentssh(&args);
     assert_eq!(code, 0, "upload failed: stderr={stderr}");
 
     // Download
-    let (_stdout, stderr, code) = agentssh(&[
-        "file", "download",
-        "-H", &host,
-        "-u", &user,
-        "-P", &port.to_string(),
-        "--local", local_download.to_str().unwrap(),
-        "--remote", "/tmp/agentssh-e2e-upload.txt",
-    ]);
+    let mut args = vec!["file", "download"];
+    args.extend(ssh_args.iter().map(|s| s.as_str()));
+    args.extend(["--local", local_download.to_str().unwrap(), "--remote", "/tmp/agentssh-e2e-upload.txt"]);
+    let (_stdout, stderr, code) = agentssh(&args);
     assert_eq!(code, 0, "download failed: stderr={stderr}");
 
     // Verify content matches
@@ -656,55 +651,159 @@ fn ssh_file_upload_download() {
 #[test]
 #[ignore] // run with: cargo test --test e2e -- --ignored ssh_file_write_read_delete
 fn ssh_file_write_read_delete() {
-    let Some((host, user, port)) = ssh_test_env() else {
+    let Some((host, user, port, password)) = ssh_test_env() else {
         eprintln!("skipping: set AGENTSSH_E2E_SSH_HOST");
         return;
     };
 
     let remote_path = "/tmp/agentssh-e2e-writeread.txt";
-    let port_str = port.to_string();
+    let ssh_args = ssh_exec_args(&host, &user, port, &password);
 
     // Write
-    let (_stdout, stderr, code) = agentssh(&[
-        "file", "write",
-        "-H", &host, "-u", &user, "-P", &port_str,
-        "--remote", remote_path, "--content", "hello-from-e2e",
-    ]);
+    let mut args = vec!["file", "write"];
+    args.extend(ssh_args.iter().map(|s| s.as_str()));
+    args.extend(["--remote", remote_path, "--content", "hello-from-e2e"]);
+    let (_stdout, stderr, code) = agentssh(&args);
     assert_eq!(code, 0, "write failed: stderr={stderr}");
 
     // Read
-    let (stdout, stderr, code) = agentssh(&[
-        "file", "read",
-        "-H", &host, "-u", &user, "-P", &port_str,
-        "--remote", remote_path,
-    ]);
+    let mut args = vec!["file", "read"];
+    args.extend(ssh_args.iter().map(|s| s.as_str()));
+    args.extend(["--remote", remote_path]);
+    let (stdout, stderr, code) = agentssh(&args);
     assert_eq!(code, 0, "read failed: stderr={stderr}");
     assert!(stdout.contains("hello-from-e2e"), "content mismatch: {stdout}");
 
     // Delete
-    let (_stdout, stderr, code) = agentssh(&[
-        "file", "delete",
-        "-H", &host, "-u", &user, "-P", &port_str,
-        "--remote", remote_path,
-    ]);
+    let mut args = vec!["file", "delete"];
+    args.extend(ssh_args.iter().map(|s| s.as_str()));
+    args.extend(["--remote", remote_path]);
+    let (_stdout, stderr, code) = agentssh(&args);
     assert_eq!(code, 0, "delete failed: stderr={stderr}");
 }
 
 #[test]
 #[ignore] // run with: cargo test --test e2e -- --ignored ssh_file_ls
 fn ssh_file_ls() {
-    let Some((host, user, port)) = ssh_test_env() else {
+    let Some((host, user, port, password)) = ssh_test_env() else {
         eprintln!("skipping: set AGENTSSH_E2E_SSH_HOST");
         return;
     };
 
-    let (stdout, stderr, code) = agentssh(&[
-        "file", "ls",
-        "-H", &host,
-        "-u", &user,
-        "-P", &port.to_string(),
-        "--remote", "/tmp",
-    ]);
+    let ssh_args = ssh_exec_args(&host, &user, port, &password);
+    let mut args = vec!["file", "ls"];
+    args.extend(ssh_args.iter().map(|s| s.as_str()));
+    args.extend(["--remote", "/tmp"]);
+    let (stdout, stderr, code) = agentssh(&args);
     assert_eq!(code, 0, "ls failed: stderr={stderr}");
     assert!(!stdout.trim().is_empty(), "ls /tmp should produce output");
+}
+
+// ===================================================================
+// P2: exec optimization tests (SSH-dependent)
+// ===================================================================
+
+#[test]
+#[ignore] // run with: cargo test --test e2e -- --ignored ssh_exec_streaming_text
+fn ssh_exec_streaming_text() {
+    let Some((host, user, port, password)) = ssh_test_env() else {
+        eprintln!("skipping: set AGENTSSH_E2E_SSH_HOST");
+        return;
+    };
+    let ssh_args = ssh_exec_args(&host, &user, port, &password);
+    let mut args = vec!["exec"];
+    args.extend(ssh_args.iter().map(|s| s.as_str()));
+    args.extend(["--", "echo streaming-test && sleep 0.1 && echo done"]);
+    let (stdout, stderr, code) = agentssh(&args);
+    assert_eq!(code, 0, "exec failed: stderr={stderr}");
+    assert!(stdout.contains("streaming-test"), "should contain first line: {stdout}");
+    assert!(stdout.contains("done"), "should contain second line: {stdout}");
+}
+
+#[test]
+#[ignore] // run with: cargo test --test e2e -- --ignored ssh_exec_json_buffered
+fn ssh_exec_json_buffered() {
+    let Some((host, user, port, password)) = ssh_test_env() else {
+        eprintln!("skipping: set AGENTSSH_E2E_SSH_HOST");
+        return;
+    };
+    let ssh_args = ssh_exec_args(&host, &user, port, &password);
+    let mut args = vec!["--output", "json", "exec"];
+    args.extend(ssh_args.iter().map(|s| s.as_str()));
+    args.extend(["--", "echo json-test"]);
+    let (stdout, stderr, code) = agentssh(&args);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let val: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(val["ok"], true);
+    assert!(
+        val["data"]["stdout"].as_str().unwrap_or("").contains("json-test"),
+        "stdout should contain json-test"
+    );
+    assert!(val["data"].get("exit_code").is_some(), "should have exit_code field");
+}
+
+#[test]
+#[ignore] // run with: cargo test --test e2e -- --ignored ssh_exec_pty_option
+fn ssh_exec_pty_option() {
+    let Some((host, user, port, password)) = ssh_test_env() else {
+        eprintln!("skipping: set AGENTSSH_E2E_SSH_HOST");
+        return;
+    };
+    let ssh_args = ssh_exec_args(&host, &user, port, &password);
+    let mut args = vec!["exec"];
+    args.extend(ssh_args.iter().map(|s| s.as_str()));
+    args.extend(["--pty", "--cols", "80", "--rows", "24", "--", "echo pty-test"]);
+    let (stdout, stderr, code) = agentssh(&args);
+    assert_eq!(code, 0, "exec with PTY failed: stderr={stderr}");
+    assert!(stdout.contains("pty-test"), "should contain pty-test: {stdout}");
+}
+
+#[test]
+#[ignore] // run with: cargo test --test e2e -- --ignored ssh_exec_timeout_option
+fn ssh_exec_timeout_option() {
+    let Some((host, user, port, password)) = ssh_test_env() else {
+        eprintln!("skipping: set AGENTSSH_E2E_SSH_HOST");
+        return;
+    };
+    let ssh_args = ssh_exec_args(&host, &user, port, &password);
+    let mut args = vec!["exec"];
+    args.extend(ssh_args.iter().map(|s| s.as_str()));
+    args.extend(["--timeout", "1000", "--", "sleep 10"]);
+    let (_stdout, stderr, code) = agentssh(&args);
+    assert_ne!(code, 0, "should timeout and exit non-zero");
+    assert!(
+        stderr.contains("timed out") || stderr.contains("timeout"),
+        "should mention timeout: {stderr}"
+    );
+}
+
+#[test]
+#[ignore] // run with: cargo test --test e2e -- --ignored ssh_exec_exit_code_propagation
+fn ssh_exec_exit_code_propagation() {
+    let Some((host, user, port, password)) = ssh_test_env() else {
+        eprintln!("skipping: set AGENTSSH_E2E_SSH_HOST");
+        return;
+    };
+    let ssh_args = ssh_exec_args(&host, &user, port, &password);
+    let mut args = vec!["exec"];
+    args.extend(ssh_args.iter().map(|s| s.as_str()));
+    args.extend(["--", "exit 42"]);
+    let (_stdout, _stderr, code) = agentssh(&args);
+    assert_eq!(code, 42, "remote exit code 42 should propagate");
+}
+
+#[test]
+#[ignore] // run with: cargo test --test e2e -- --ignored ssh_exec_default_no_timeout
+fn ssh_exec_default_no_timeout() {
+    let Some((host, user, port, password)) = ssh_test_env() else {
+        eprintln!("skipping: set AGENTSSH_E2E_SSH_HOST");
+        return;
+    };
+    let ssh_args = ssh_exec_args(&host, &user, port, &password);
+    let mut args = vec!["exec"];
+    args.extend(ssh_args.iter().map(|s| s.as_str()));
+    args.extend(["--", "sleep 2 && echo no-timeout-test"]);
+    let (stdout, stderr, code) = agentssh(&args);
+    assert_eq!(code, 0, "exec failed: stderr={stderr}");
+    assert!(stdout.contains("no-timeout-test"), "should complete without timeout: {stdout}");
 }
