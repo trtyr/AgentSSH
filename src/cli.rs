@@ -2,8 +2,8 @@ use crate::kernel;
 use crate::profile;
 use crate::protocol::WireRequest;
 use crate::ssh_backend;
-use crate::util::{DEFAULT_COLS, DEFAULT_EXEC_TIMEOUT_MS, DEFAULT_LIMIT, DEFAULT_ROWS, DEFAULT_WAIT_MS, OutputFormat};
-use anyhow::Result;
+use crate::util::{DEFAULT_COLS, DEFAULT_EXEC_TIMEOUT_MS, DEFAULT_LIMIT, DEFAULT_ROWS, DEFAULT_SUSPEND_TIMEOUT_MS, DEFAULT_WAIT_MS, OutputFormat};
+use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -13,11 +13,8 @@ use std::path::PathBuf;
 #[command(about = "SSH toolkit for AI agents")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 pub struct Cli {
-    /// Output JSON (legacy, use --output json instead)
-    #[arg(long, global = true, conflicts_with = "output")]
-    pub json: bool,
     /// Output format: json or text (default: text)
-    #[arg(long, global = true, value_enum, conflicts_with = "json")]
+    #[arg(long, global = true, value_enum)]
     pub output: Option<OutputFormat>,
 
     #[command(subcommand)]
@@ -26,11 +23,7 @@ pub struct Cli {
 
 impl Cli {
     pub fn effective_json(&self) -> bool {
-        match self.output {
-            Some(OutputFormat::Json) => true,
-            Some(OutputFormat::Text) => false,
-            None => self.json,
-        }
+        matches!(self.output, Some(OutputFormat::Json))
     }
 }
 
@@ -203,18 +196,15 @@ pub struct ConnectArgs {
     /// SSH username
     #[arg(short = 'u', long)]
     pub username: Option<String>,
+    /// Password (prefix with $ to read from env var, e.g. --password $MY_PASS)
     #[arg(long)]
     pub password: Option<String>,
+    /// Private key: file path, env var ($ prefix), or inline key content
     #[arg(long)]
-    pub password_env: Option<String>,
-    #[arg(long)]
-    pub private_key_path: Option<PathBuf>,
-    #[arg(long)]
-    pub private_key_env: Option<String>,
+    pub private_key: Option<String>,
+    /// Passphrase for private key (prefix with $ to read from env var)
     #[arg(long)]
     pub passphrase: Option<String>,
-    #[arg(long)]
-    pub passphrase_env: Option<String>,
     #[arg(long)]
     pub ready_timeout_ms: Option<u64>,
     #[arg(long)]
@@ -223,15 +213,27 @@ pub struct ConnectArgs {
     pub retry_delay_ms: Option<u64>,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct ExecCommand {
     #[command(flatten)]
     pub connect: ConnectArgs,
     #[arg(required = true, trailing_var_arg = true)]
     pub command: Vec<String>,
-    /// Command execution timeout in milliseconds
+    /// Command execution timeout in milliseconds (0 = no timeout)
     #[arg(long, default_value_t = DEFAULT_EXEC_TIMEOUT_MS)]
     pub timeout: u64,
+    /// Suspend timeout in milliseconds: if command still running after this, auto-suspend to session (0 = never suspend)
+    #[arg(long, default_value_t = DEFAULT_SUSPEND_TIMEOUT_MS)]
+    pub suspend_timeout: u64,
+    /// Allocate a PTY before executing (for interactive programs like top/htop)
+    #[arg(long, default_value_t = false)]
+    pub pty: bool,
+    /// PTY columns (only used with --pty)
+    #[arg(long, default_value_t = DEFAULT_COLS)]
+    pub cols: u32,
+    /// PTY rows (only used with --pty)
+    #[arg(long, default_value_t = DEFAULT_ROWS)]
+    pub rows: u32,
 }
 
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
@@ -263,10 +265,8 @@ pub struct SessionInputCommand {
     pub wait_ms: u64,
     #[arg(long, default_value_t = DEFAULT_LIMIT)]
     pub limit: usize,
-    #[arg(long, conflicts_with = "strip_ansi")]
+    #[arg(long)]
     pub raw: bool,
-    #[arg(long, conflicts_with = "raw")]
-    pub strip_ansi: bool,
     #[arg(long, default_value_t = false)]
     pub wait_for_exit: bool,
     /// Wait for output to settle (no new data for this many ms) before returning.
@@ -275,27 +275,33 @@ pub struct SessionInputCommand {
     pub wait_idle: Option<u64>,
     #[arg(long)]
     pub timeout: Option<u64>,
+    /// Expect pattern (repeatable, pairs with --respond by index)
     #[arg(long)]
-    pub expect: Option<String>,
+    pub expect: Vec<String>,
+    /// Respond string (repeatable, pairs with --expect by index)
     #[arg(long)]
-    pub respond: Option<String>,
-    #[arg(long)]
-    pub expect2: Option<String>,
-    #[arg(long)]
-    pub respond2: Option<String>,
-    #[arg(long)]
-    pub expect3: Option<String>,
-    #[arg(long)]
-    pub respond3: Option<String>,
+    pub respond: Vec<String>,
 }
 
 impl SessionInputCommand {
     pub fn expect_pairs(&self) -> Result<Vec<ExpectRespondPair>> {
-        crate::interactive::expect_pairs([
-            (self.expect.clone(), self.respond.clone()),
-            (self.expect2.clone(), self.respond2.clone()),
-            (self.expect3.clone(), self.respond3.clone()),
-        ])
+        if self.expect.len() != self.respond.len() {
+            bail!(
+                "--expect and --respond must have the same count (got {} vs {})",
+                self.expect.len(),
+                self.respond.len()
+            );
+        }
+        Ok(self
+            .expect
+            .iter()
+            .zip(self.respond.iter())
+            .filter(|(e, _)| !e.is_empty())
+            .map(|(e, r)| ExpectRespondPair {
+                expect: e.clone(),
+                respond: r.clone(),
+            })
+            .collect())
     }
 }
 
@@ -331,10 +337,9 @@ pub struct ReadCommand {
     pub wait_ms: u64,
     #[arg(long, default_value_t = false)]
     pub follow: bool,
-    #[arg(long, conflicts_with = "strip_ansi")]
+    #[arg(long)]
     pub raw: bool,
-    #[arg(long, conflicts_with = "raw")]
-    pub strip_ansi: bool,
+    /// Follow timeout in milliseconds (0 = no timeout)
     #[arg(long, default_value_t = DEFAULT_EXEC_TIMEOUT_MS)]
     pub timeout: u64,
 }
@@ -369,7 +374,7 @@ pub struct SessionExecCommand {
     pub session_id: String,
     #[arg(required = true, trailing_var_arg = true)]
     pub command: Vec<String>,
-    /// Command execution timeout in milliseconds
+    /// Command execution timeout in milliseconds (0 = no timeout)
     #[arg(long, default_value_t = DEFAULT_EXEC_TIMEOUT_MS)]
     pub timeout: u64,
     /// Fire the command and return immediately without waiting for output
@@ -377,12 +382,19 @@ pub struct SessionExecCommand {
     pub detach: bool,
 }
 
+/// Common args for all file operations: connection + session routing.
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
-pub struct TransferCommand {
+pub struct FileArgs {
     #[command(flatten)]
     pub connect: ConnectArgs,
     #[arg(long)]
     pub session_id: Option<String>,
+}
+
+#[derive(Args, Clone, Serialize, Deserialize, Debug)]
+pub struct TransferCommand {
+    #[command(flatten)]
+    pub file: FileArgs,
     #[arg(long)]
     pub local: PathBuf,
     #[arg(long)]
@@ -394,9 +406,7 @@ pub struct TransferCommand {
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct ListCommand {
     #[command(flatten)]
-    pub connect: ConnectArgs,
-    #[arg(long)]
-    pub session_id: Option<String>,
+    pub file: FileArgs,
     #[arg(long, default_value = ".")]
     pub remote: PathBuf,
     #[arg(long, default_value = "auto", value_parser = ["auto", "sftp", "scp"])]
@@ -406,9 +416,7 @@ pub struct ListCommand {
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct WriteCommand {
     #[command(flatten)]
-    pub connect: ConnectArgs,
-    #[arg(long)]
-    pub session_id: Option<String>,
+    pub file: FileArgs,
     #[arg(long)]
     pub remote: PathBuf,
     #[arg(long)]
@@ -421,9 +429,7 @@ pub struct WriteCommand {
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct ReadFileCommand {
     #[command(flatten)]
-    pub connect: ConnectArgs,
-    #[arg(long)]
-    pub session_id: Option<String>,
+    pub file: FileArgs,
     #[arg(long)]
     pub remote: PathBuf,
 }
@@ -431,9 +437,7 @@ pub struct ReadFileCommand {
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct DeleteFileCommand {
     #[command(flatten)]
-    pub connect: ConnectArgs,
-    #[arg(long)]
-    pub session_id: Option<String>,
+    pub file: FileArgs,
     #[arg(long)]
     pub remote: PathBuf,
     #[arg(long)]
@@ -443,9 +447,7 @@ pub struct DeleteFileCommand {
 #[derive(Args, Clone, Serialize, Deserialize, Debug)]
 pub struct EditFileCommand {
     #[command(flatten)]
-    pub connect: ConnectArgs,
-    #[arg(long)]
-    pub session_id: Option<String>,
+    pub file: FileArgs,
     #[arg(long)]
     pub remote: PathBuf,
     #[arg(long)]
@@ -492,7 +494,7 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let json = cli.effective_json();
     let result: Result<()> = match cli.command {
-        Command::Exec(command) => ssh_backend::run_exec(command, json),
+        Command::Exec(command) => kernel::run_client(WireRequest::ExecOnce(command), json),
         Command::Shell(connect) => ssh_backend::run_shell(connect, json),
         Command::Connect(command) => kernel::run_client(WireRequest::Connect(command), json),
         Command::Session(group) => match group.command {
@@ -517,49 +519,49 @@ pub fn run() -> Result<()> {
         },
         Command::File(group) => match group.command {
             FileCommand::Upload(command) => {
-                if command.session_id.is_some() {
+                if command.file.session_id.is_some() {
                     kernel::run_client(WireRequest::Upload(command), json)
                 } else {
                     ssh_backend::run_upload_once(command, json)
                 }
             }
             FileCommand::Download(command) => {
-                if command.session_id.is_some() {
+                if command.file.session_id.is_some() {
                     kernel::run_client(WireRequest::Download(command), json)
                 } else {
                     ssh_backend::run_download_once(command, json)
                 }
             }
             FileCommand::Ls(command) => {
-                if command.session_id.is_some() {
+                if command.file.session_id.is_some() {
                     kernel::run_client(WireRequest::Ls(command), json)
                 } else {
                     ssh_backend::run_ls_once(command, json)
                 }
             }
             FileCommand::Write(command) => {
-                if command.session_id.is_some() {
+                if command.file.session_id.is_some() {
                     kernel::run_client(WireRequest::Write(command), json)
                 } else {
                     ssh_backend::run_write_once(command, json)
                 }
             }
             FileCommand::Read(command) => {
-                if command.session_id.is_some() {
+                if command.file.session_id.is_some() {
                     kernel::run_client(WireRequest::ReadFile(command), json)
                 } else {
                     ssh_backend::run_read_once(command, json)
                 }
             }
             FileCommand::Delete(command) => {
-                if command.session_id.is_some() {
+                if command.file.session_id.is_some() {
                     kernel::run_client(WireRequest::DeleteFile(command), json)
                 } else {
                     ssh_backend::run_delete_once(command, json)
                 }
             }
             FileCommand::Edit(command) => {
-                if command.session_id.is_some() {
+                if command.file.session_id.is_some() {
                     kernel::run_client(WireRequest::EditFile(command), json)
                 } else {
                     ssh_backend::run_edit_once(command, json)
@@ -620,7 +622,6 @@ mod tests {
         let cli = Cli::try_parse_from(["agentssh", "session", "ping", "--session-id", "s1"])
             .expect("session ping should parse");
 
-        assert!(!cli.json);
         match cli.command {
             Command::Session(group) => match group.command {
                 SessionCommand::Ping(command) => assert_eq!(command.session_id, "s1"),
@@ -641,7 +642,6 @@ mod tests {
             "--follow",
             "--timeout",
             "1500",
-            "--strip-ansi",
         ])
         .expect("follow read should parse");
 
@@ -651,29 +651,11 @@ mod tests {
                     assert!(command.follow);
                     assert_eq!(command.timeout, 1500);
                     assert!(!command.raw);
-                    assert!(command.strip_ansi);
                 }
                 other => panic!("expected read command, got {other:?}"),
             },
             other => panic!("expected session group, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn rejects_conflicting_read_ansi_flags() {
-        let error = Cli::try_parse_from([
-            "agentssh",
-            "session",
-            "read",
-            "--session-id",
-            "s1",
-            "--raw",
-            "--strip-ansi",
-        ])
-        .expect_err("conflicting ansi flags should fail");
-
-        assert!(error.to_string().contains("--raw"));
-        assert!(error.to_string().contains("--strip-ansi"));
     }
 
     #[test]
@@ -710,9 +692,9 @@ mod tests {
             "[sudo] password",
             "--respond",
             "secret\n",
-            "--expect2",
+            "--expect",
             "continue?",
-            "--respond2",
+            "--respond",
             "y\n",
             "--wait-for-exit",
             "--timeout",
@@ -733,31 +715,11 @@ mod tests {
                     assert!(command.wait_for_exit);
                     assert_eq!(command.timeout, Some(2500));
                     assert!(command.raw);
-                    assert!(!command.strip_ansi);
                 }
                 other => panic!("expected send command, got {other:?}"),
             },
             other => panic!("expected session group, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn rejects_conflicting_send_ansi_flags() {
-        let error = Cli::try_parse_from([
-            "agentssh",
-            "session",
-            "send",
-            "--session-id",
-            "s1",
-            "--input",
-            "echo hi\n",
-            "--raw",
-            "--strip-ansi",
-        ])
-        .expect_err("conflicting ansi flags should fail");
-
-        assert!(error.to_string().contains("--raw"));
-        assert!(error.to_string().contains("--strip-ansi"));
     }
 
     #[test]
@@ -769,20 +731,15 @@ mod tests {
             wait_ms: 100,
             limit: 1000,
             raw: false,
-            strip_ansi: false,
             wait_for_exit: false,
             wait_idle: None,
             timeout: None,
-            expect: Some("password".to_string()),
-            respond: None,
-            expect2: None,
-            respond2: None,
-            expect3: None,
-            respond3: None,
+            expect: vec!["password".to_string()],
+            respond: vec![],
         };
 
         let error = command.expect_pairs().expect_err("missing respond should fail");
-        assert!(error.to_string().contains("--expect requires matching --respond"));
+        assert!(error.to_string().contains("--expect and --respond must have the same count"));
     }
 
     #[test]
@@ -805,7 +762,7 @@ mod tests {
         match cli.command {
             Command::File(group) => match group.command {
                 FileCommand::Upload(command) => {
-                    assert_eq!(command.connect.profile.as_deref(), Some("prod"));
+                    assert_eq!(command.file.connect.profile.as_deref(), Some("prod"));
                     assert_eq!(command.local, PathBuf::from("./local.txt"));
                     assert_eq!(command.remote, PathBuf::from("/tmp/remote.txt"));
                     assert_eq!(command.method, "scp");
@@ -832,7 +789,7 @@ mod tests {
         match cli.command {
             Command::File(group) => match group.command {
                 FileCommand::Ls(command) => {
-                    assert_eq!(command.connect.profile.as_deref(), Some("prod"));
+                    assert_eq!(command.file.connect.profile.as_deref(), Some("prod"));
                     assert_eq!(command.remote, PathBuf::from("/tmp"));
                     assert_eq!(command.method, "auto");
                 }

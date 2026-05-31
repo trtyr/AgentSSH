@@ -69,7 +69,7 @@ pub struct OutputBuffer {
 }
 
 impl OutputBuffer {
-    fn extend(&mut self, new_data: &[u8]) {
+    pub fn extend(&mut self, new_data: &[u8]) {
         self.data.extend_from_slice(new_data);
         if self.data.len() > MAX_BUFFER {
             let excess = self.data.len() - MAX_BUFFER;

@@ -1,5 +1,5 @@
 use crate::cli::ConnectArgs;
-use crate::util::{self, DEFAULT_EXEC_TIMEOUT_MS, DEFAULT_PORT};
+use crate::util::{self, DEFAULT_PORT};
 use anyhow::{Context, Result, bail};
 use russh::client::AuthResult;
 use russh::keys::{self, PrivateKeyWithHashAlg};
@@ -286,16 +286,22 @@ pub async fn connect_with_info(
     Ok((Arc::new(handle), host, port, username))
 }
 
-/// Try authentication methods in order: key_env → key_file → password → ssh-agent.
+/// Try authentication methods in order: private_key → password → ssh-agent.
 async fn authenticate(
     handle: &mut SharedConnectionHandle,
     username: &str,
     args: &ConnectArgs,
 ) -> Result<()> {
-    // 1. Key from env variable content
-    if let Some(content) = key_content(args) {
-        let key = keys::decode_secret_key(&content, passphrase(args).as_deref())
-            .context("decoding private key from content")?;
+    // 1. Private key (--private-key: env var $ prefix, file path, or inline content)
+    if let Some(content) = resolve_private_key(args) {
+        // If it's a file path, load it; otherwise decode inline content
+        let key = if let Some(path) = resolve_private_key_path(args) {
+            keys::load_secret_key(&path, resolve_passphrase(args).as_deref())
+                .with_context(|| format!("loading private key from {:?}", path))?
+        } else {
+            keys::decode_secret_key(&content, resolve_passphrase(args).as_deref())
+                .context("decoding private key from content")?
+        };
         let hash_alg = handle
             .best_supported_rsa_hash()
             .await
@@ -304,36 +310,16 @@ async fn authenticate(
         let ok = handle
             .authenticate_publickey(username, key_with_alg)
             .await
-            .context("publickey auth from content")?;
+            .context("publickey auth")?;
         if ok.success() {
             return Ok(());
         }
     }
 
-    // 2. Pubkey file (--private-key-path)
-    if let Some(key_path) = args.private_key_path.as_ref() {
-        let expanded = util::expand_home(key_path);
-        let key = keys::load_secret_key(expanded, passphrase(args).as_deref())
-            .with_context(|| format!("loading private key from {:?}", key_path))?;
-        let hash_alg = handle
-            .best_supported_rsa_hash()
-            .await
-            .context("getting supported RSA hash")?;
-        let key_with_alg = PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg.flatten());
+    // 2. Password (--password: env var $ prefix or literal)
+    if let Some(pass) = resolve_password(args) {
         let ok = handle
-            .authenticate_publickey(username, key_with_alg)
-            .await
-            .with_context(|| format!("publickey auth with {:?}", key_path))?;
-        if ok.success() {
-            return Ok(());
-        }
-    }
-
-    // 3. Password (inline --password or from --password-env)
-    let env_password = password_from_env(args);
-    if let Some(pass) = args.password.as_deref().or(env_password.as_deref()) {
-        let ok = handle
-            .authenticate_password(username, pass)
+            .authenticate_password(username, &pass)
             .await
             .context("password auth")?;
         if ok.success() {
@@ -341,8 +327,8 @@ async fn authenticate(
         }
     }
 
-    // 4. SSH agent (fallback when no explicit auth)
-    if args.private_key_path.is_none() && args.password.is_none() && key_content(args).is_none() {
+    // 3. SSH agent (fallback when no explicit auth)
+    if args.private_key.is_none() && args.password.is_none() {
         let mut agent = keys::agent::client::AgentClient::connect_env()
             .await
             .context("connecting to SSH agent")?;
@@ -377,12 +363,19 @@ async fn authenticate(
 // ---------------------------------------------------------------------------
 
 /// Execute a command on an already-opened channel and return (stdout, stderr, exit_code).
+/// Execute a command and buffer all output (used for JSON mode).
 pub async fn exec_channel(
     channel: &mut Channel<client::Msg>,
     cmd: &str,
     timeout_ms: Option<u64>,
 ) -> Result<(String, String, i32)> {
-    let timeout = Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_EXEC_TIMEOUT_MS));
+    let timeout_ms = timeout_ms.unwrap_or(0);
+    let has_timeout = timeout_ms > 0;
+    let deadline = if has_timeout {
+        Some(tokio::time::Instant::now() + Duration::from_millis(timeout_ms))
+    } else {
+        None
+    };
 
     channel
         .exec(true, cmd)
@@ -393,39 +386,36 @@ pub async fn exec_channel(
     let mut stderr = Vec::new();
     let mut exit_code: i32 = -1;
     let mut saw_eof = false;
-    let deadline = tokio::time::Instant::now() + timeout;
 
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            bail!("exec timed out after {}ms", timeout.as_millis());
-        }
-
-        match tokio::time::timeout(remaining, channel.wait()).await {
-            Ok(Some(ChannelMsg::Data { data })) => {
-                stdout.extend_from_slice(&data);
+        if let Some(dl) = deadline {
+            let remaining = dl.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                bail!("exec timed out after {}ms", timeout_ms);
             }
-            Ok(Some(ChannelMsg::ExtendedData { data, ext: 1 })) => {
-                stderr.extend_from_slice(&data);
-            }
-            Ok(Some(ChannelMsg::ExitStatus { exit_status })) => {
-                exit_code = exit_status as i32;
-                if saw_eof {
-                    break;
+            match tokio::time::timeout(remaining, channel.wait()).await {
+                Ok(msg) => {
+                    if !handle_exec_msg(msg, &mut stdout, &mut stderr, &mut exit_code, &mut saw_eof)
+                    {
+                        break;
+                    }
                 }
+                Err(_) => bail!("exec timed out after {}ms", timeout_ms),
             }
-            Ok(Some(ChannelMsg::Eof)) => {
-                saw_eof = true;
-                if exit_code != -1 {
-                    break;
+        } else {
+            match channel.wait().await {
+                Some(msg) => {
+                    if !handle_exec_msg(
+                        Some(msg),
+                        &mut stdout,
+                        &mut stderr,
+                        &mut exit_code,
+                        &mut saw_eof,
+                    ) {
+                        break;
+                    }
                 }
-            }
-            Ok(None) => {
-                break;
-            }
-            Ok(Some(_)) => {} // ignore other messages
-            Err(_) => {
-                bail!("exec timed out after {}ms", timeout.as_millis());
+                None => break,
             }
         }
     }
@@ -435,6 +425,120 @@ pub async fn exec_channel(
         String::from_utf8_lossy(&stderr).into_owned(),
         exit_code,
     ))
+}
+
+/// Execute a command and stream output to writers in real-time (used for text mode).
+#[allow(dead_code)]
+pub async fn exec_channel_streaming(
+    channel: &mut Channel<client::Msg>,
+    cmd: &str,
+    timeout_ms: Option<u64>,
+    stdout_writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    stderr_writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> Result<i32> {
+    use tokio::io::AsyncWriteExt;
+
+    let timeout_ms = timeout_ms.unwrap_or(0);
+    let has_timeout = timeout_ms > 0;
+    let deadline = if has_timeout {
+        Some(tokio::time::Instant::now() + Duration::from_millis(timeout_ms))
+    } else {
+        None
+    };
+
+    channel
+        .exec(true, cmd)
+        .await
+        .with_context(|| format!("exec: {}", cmd))?;
+
+    let mut exit_code: i32 = -1;
+    let mut saw_eof = false;
+
+    loop {
+        let msg = if let Some(dl) = deadline {
+            let remaining = dl.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                let _ = stdout_writer.flush().await;
+                let _ = stderr_writer.flush().await;
+                bail!("exec timed out after {}ms", timeout_ms);
+            }
+            match tokio::time::timeout(remaining, channel.wait()).await {
+                Ok(m) => m,
+                Err(_) => {
+                    let _ = stdout_writer.flush().await;
+                    let _ = stderr_writer.flush().await;
+                    bail!("exec timed out after {}ms", timeout_ms);
+                }
+            }
+        } else {
+            channel.wait().await
+        };
+
+        match msg {
+            Some(ChannelMsg::Data { data }) => {
+                stdout_writer.write_all(&data).await?;
+                stdout_writer.flush().await?;
+            }
+            Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+                stderr_writer.write_all(&data).await?;
+                stderr_writer.flush().await?;
+            }
+            Some(ChannelMsg::ExitStatus { exit_status }) => {
+                exit_code = exit_status as i32;
+                if saw_eof {
+                    break;
+                }
+            }
+            Some(ChannelMsg::Eof) => {
+                saw_eof = true;
+                if exit_code != -1 {
+                    break;
+                }
+            }
+            None => break,
+            _ => {} // ignore other messages
+        }
+    }
+
+    Ok(exit_code)
+}
+
+/// Handle a single exec channel message. Returns false when done.
+pub fn handle_exec_msg(
+    msg: Option<ChannelMsg>,
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+    exit_code: &mut i32,
+    saw_eof: &mut bool,
+) -> bool {
+    match msg {
+        Some(ChannelMsg::Data { data }) => {
+            stdout.extend_from_slice(&data);
+            true
+        }
+        Some(ChannelMsg::ExtendedData { data, ext: 1 }) => {
+            stderr.extend_from_slice(&data);
+            true
+        }
+        Some(ChannelMsg::ExitStatus { exit_status }) => {
+            *exit_code = exit_status as i32;
+            if *saw_eof {
+                false
+            } else {
+                true
+            }
+        }
+        Some(ChannelMsg::Eof) => {
+            *saw_eof = true;
+            if *exit_code != -1 {
+                false
+            } else {
+                true
+            }
+        }
+        None => false,
+        Some(_) => true, // ignore other messages
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -470,55 +574,65 @@ pub fn merge_connect_args(base: &ConnectArgs, override_args: &ConnectArgs) -> Co
             .password
             .clone()
             .or_else(|| base.password.clone()),
-        password_env: override_args
-            .password_env
+        private_key: override_args
+            .private_key
             .clone()
-            .or_else(|| base.password_env.clone()),
-        private_key_path: override_args
-            .private_key_path
-            .clone()
-            .or_else(|| base.private_key_path.clone()),
-        private_key_env: override_args
-            .private_key_env
-            .clone()
-            .or_else(|| base.private_key_env.clone()),
+            .or_else(|| base.private_key.clone()),
         passphrase: override_args
             .passphrase
             .clone()
             .or_else(|| base.passphrase.clone()),
-        passphrase_env: override_args
-            .passphrase_env
-            .clone()
-            .or_else(|| base.passphrase_env.clone()),
         ready_timeout_ms: override_args.ready_timeout_ms.or(base.ready_timeout_ms),
         retry: override_args.retry.or(base.retry),
         retry_delay_ms: override_args.retry_delay_ms.or(base.retry_delay_ms),
     }
 }
 
-/// Get key content from --private-key-env environment variable.
-fn key_content(args: &ConnectArgs) -> Option<String> {
-    args.private_key_env
-        .as_ref()
-        .and_then(|var| std::env::var(var).ok())
+/// Resolve a value that may be an env var reference ($ prefix) or literal.
+fn resolve_env(val: &str) -> Option<String> {
+    if let Some(var_name) = val.strip_prefix('$') {
+        std::env::var(var_name).ok()
+    } else {
+        Some(val.to_string())
+    }
 }
 
-/// Get password from --password-env environment variable.
-fn password_from_env(args: &ConnectArgs) -> Option<String> {
-    args.password_env
-        .as_ref()
-        .and_then(|var| std::env::var(var).ok())
+/// Get password: if starts with `$` read from env, otherwise literal.
+fn resolve_password(args: &ConnectArgs) -> Option<String> {
+    args.password.as_deref().and_then(resolve_env)
 }
 
-/// Get passphrase (from env or direct).
-fn passphrase(args: &ConnectArgs) -> Option<String> {
-    args.passphrase
-        .clone()
-        .or_else(|| {
-            args.passphrase_env
-                .as_ref()
-                .and_then(|var| std::env::var(var).ok())
-        })
+/// Get private key content: `$` prefix → env var, existing file → read file, otherwise inline key.
+fn resolve_private_key(args: &ConnectArgs) -> Option<String> {
+    let val = args.private_key.as_ref()?;
+    if let Some(var_name) = val.strip_prefix('$') {
+        return std::env::var(var_name).ok();
+    }
+    let expanded = util::expand_home(std::path::Path::new(val));
+    if expanded.exists() {
+        std::fs::read_to_string(&expanded).ok()
+    } else {
+        Some(val.clone())
+    }
+}
+
+/// Get private key as file path (only if it's an actual file path, not env/inline).
+fn resolve_private_key_path(args: &ConnectArgs) -> Option<std::path::PathBuf> {
+    let val = args.private_key.as_ref()?;
+    if val.starts_with('$') {
+        return None; // env var, not a path
+    }
+    let expanded = util::expand_home(std::path::Path::new(val));
+    if expanded.exists() {
+        Some(expanded)
+    } else {
+        None // inline key content, not a path
+    }
+}
+
+/// Get passphrase: if starts with `$` read from env, otherwise literal.
+fn resolve_passphrase(args: &ConnectArgs) -> Option<String> {
+    args.passphrase.as_deref().and_then(resolve_env)
 }
 
 // ---------------------------------------------------------------------------
@@ -542,11 +656,8 @@ mod tests {
             port: Some(2222),
             username: Some("base-user".into()),
             password: None,
-            password_env: None,
-            private_key_path: None,
-            private_key_env: None,
+            private_key: None,
             passphrase: None,
-            passphrase_env: None,
             ready_timeout_ms: None,
             retry: Some(3),
             retry_delay_ms: Some(500),
@@ -557,11 +668,8 @@ mod tests {
             port: None,
             username: None,
             password: None,
-            password_env: None,
-            private_key_path: None,
-            private_key_env: None,
+            private_key: None,
             passphrase: None,
-            passphrase_env: None,
             ready_timeout_ms: None,
             retry: None,
             retry_delay_ms: None,

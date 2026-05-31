@@ -1,9 +1,10 @@
 use crate::cli::ConnectArgs;
 use crate::util;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::json;
 
 /// One-shot exec: connect, run command, return output.
+#[allow(dead_code)]
 pub fn run_exec(command: crate::cli::ExecCommand, json_output: bool) -> Result<()> {
     let args = crate::connection::resolve_connect_args(&command.connect)?;
     let rt = tokio::runtime::Runtime::new()?;
@@ -14,30 +15,48 @@ pub fn run_exec(command: crate::cli::ExecCommand, json_output: bool) -> Result<(
             .channel_open_session()
             .await?;
 
-        let cmd = command.command.join(" ");
-        let (stdout, stderr, exit_code) =
-            crate::connection::exec_channel(&mut channel, &cmd, Some(command.timeout)).await?;
-
-        let result = json!({
-            "ok": true,
-            "stdout": stdout,
-            "stderr": stderr,
-            "exit_code": exit_code,
-        });
-
-        if json_output {
-            util::print_json(&result)?;
-        } else {
-            if !stdout.is_empty() {
-                print!("{}", stdout);
-            }
-            if !stderr.is_empty() {
-                eprint!("{}", stderr);
-            }
+        // Request PTY if --pty is set
+        if command.pty {
+            channel
+                .request_pty(true, "xterm-256color", command.cols, command.rows, 0, 0, &[])
+                .await
+                .context("requesting PTY")?;
         }
 
-        if exit_code != 0 {
-            std::process::exit(exit_code);
+        let cmd = command.command.join(" ");
+
+        if json_output {
+            // JSON mode: buffer all output, return complete JSON
+            let (stdout, stderr, exit_code) =
+                crate::connection::exec_channel(&mut channel, &cmd, Some(command.timeout)).await?;
+
+            let result = json!({
+                "ok": true,
+                "stdout": stdout,
+                "stderr": stderr,
+                "exit_code": exit_code,
+            });
+            util::print_json(&result)?;
+
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        } else {
+            // Text mode: stream output in real-time
+            let mut stdout = tokio::io::stdout();
+            let mut stderr = tokio::io::stderr();
+            let exit_code = crate::connection::exec_channel_streaming(
+                &mut channel,
+                &cmd,
+                Some(command.timeout),
+                &mut stdout,
+                &mut stderr,
+            )
+            .await?;
+
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
         }
 
         Ok(())

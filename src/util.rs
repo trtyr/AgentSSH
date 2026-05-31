@@ -11,7 +11,10 @@ pub const DEFAULT_COLS: u32 = 120;
 pub const DEFAULT_ROWS: u32 = 40;
 pub const DEFAULT_LIMIT: usize = 8_000;
 pub const DEFAULT_WAIT_MS: u64 = 250;
-pub const DEFAULT_EXEC_TIMEOUT_MS: u64 = 30_000;
+/// 0 = no timeout (wait indefinitely)
+pub const DEFAULT_EXEC_TIMEOUT_MS: u64 = 0;
+/// Default suspend timeout: 30 seconds. If command still running after this, auto-suspend to session.
+pub const DEFAULT_SUSPEND_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {

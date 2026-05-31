@@ -10,7 +10,7 @@ use tokio::io::AsyncWriteExt;
 // ---------------------------------------------------------------------------
 
 pub async fn upload_once(cmd: &TransferCommand, _json: bool) -> Result<()> {
-    let args = connection::resolve_connect_args(&cmd.connect)?;
+    let args = connection::resolve_connect_args(&cmd.file.connect)?;
     let (handle, _, _, _) = connection::connect_with_info(&args).await?;
     let local = cmd.local.to_string_lossy();
     let remote = cmd.remote.to_string_lossy();
@@ -20,7 +20,7 @@ pub async fn upload_once(cmd: &TransferCommand, _json: bool) -> Result<()> {
 }
 
 pub async fn download_once(cmd: &TransferCommand, _json: bool) -> Result<()> {
-    let args = connection::resolve_connect_args(&cmd.connect)?;
+    let args = connection::resolve_connect_args(&cmd.file.connect)?;
     let (handle, _, _, _) = connection::connect_with_info(&args).await?;
     let local = cmd.local.to_string_lossy();
     let remote = cmd.remote.to_string_lossy();
@@ -30,7 +30,7 @@ pub async fn download_once(cmd: &TransferCommand, _json: bool) -> Result<()> {
 }
 
 pub async fn ls_once(cmd: &ListCommand, _json: bool) -> Result<()> {
-    let args = connection::resolve_connect_args(&cmd.connect)?;
+    let args = connection::resolve_connect_args(&cmd.file.connect)?;
     let (handle, _, _, _) = connection::connect_with_info(&args).await?;
     let remote = cmd.remote.to_string_lossy();
     let result = do_ls(&handle, &remote, &cmd.method).await?;
@@ -39,7 +39,7 @@ pub async fn ls_once(cmd: &ListCommand, _json: bool) -> Result<()> {
 }
 
 pub async fn write_once(cmd: &WriteCommand, _json: bool) -> Result<()> {
-    let args = connection::resolve_connect_args(&cmd.connect)?;
+    let args = connection::resolve_connect_args(&cmd.file.connect)?;
     let (handle, _, _, _) = connection::connect_with_info(&args).await?;
     let remote = cmd.remote.to_string_lossy();
     let result = do_write(&handle, &remote, cmd.content.as_bytes(), &cmd.content.len(), &"auto").await?;
@@ -48,7 +48,7 @@ pub async fn write_once(cmd: &WriteCommand, _json: bool) -> Result<()> {
 }
 
 pub async fn read_once(cmd: &ReadFileCommand, _json: bool) -> Result<()> {
-    let args = connection::resolve_connect_args(&cmd.connect)?;
+    let args = connection::resolve_connect_args(&cmd.file.connect)?;
     let (handle, _, _, _) = connection::connect_with_info(&args).await?;
     let remote = cmd.remote.to_string_lossy();
     let result = do_read_file(&handle, &remote).await?;
@@ -57,7 +57,7 @@ pub async fn read_once(cmd: &ReadFileCommand, _json: bool) -> Result<()> {
 }
 
 pub async fn delete_once(cmd: &DeleteFileCommand, _json: bool) -> Result<()> {
-    let args = connection::resolve_connect_args(&cmd.connect)?;
+    let args = connection::resolve_connect_args(&cmd.file.connect)?;
     let (handle, _, _, _) = connection::connect_with_info(&args).await?;
     let remote = cmd.remote.to_string_lossy();
     let result = do_delete(&handle, &remote, cmd.recursive).await?;
@@ -66,7 +66,7 @@ pub async fn delete_once(cmd: &DeleteFileCommand, _json: bool) -> Result<()> {
 }
 
 pub async fn edit_once(cmd: &EditFileCommand, _json: bool) -> Result<()> {
-    let args = connection::resolve_connect_args(&cmd.connect)?;
+    let args = connection::resolve_connect_args(&cmd.file.connect)?;
     let (handle, _, _, _) = connection::connect_with_info(&args).await?;
     let remote = cmd.remote.to_string_lossy();
     let result = do_edit(&handle, &remote, &cmd.find, &cmd.replace).await?;

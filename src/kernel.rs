@@ -205,6 +205,10 @@ async fn handle_request(request: WireRequest, state: Arc<Mutex<ServerState>>) ->
             handle_exec_request(cmd, state).await
         }
 
+        WireRequest::ExecOnce(cmd) => {
+            handle_exec_once_request(cmd, state).await
+        }
+
         WireRequest::Resize(cmd) => {
             let mut state = state.lock().await;
             match session::daemon_resize(&cmd.session_id, cmd.cols, cmd.rows, &mut state).await {
@@ -501,6 +505,203 @@ async fn handle_exec_request(cmd: SessionExecCommand, state: Arc<Mutex<ServerSta
     }
 }
 
+/// One-shot exec through daemon with auto-suspend on timeout.
+/// If command finishes within suspend_timeout → return result.
+/// If still running → create session, return session ID with instructions.
+async fn handle_exec_once_request(cmd: ExecCommand, state: Arc<Mutex<ServerState>>) -> WireResponse {
+    let suspend_timeout = cmd.suspend_timeout;
+
+    // If suspend_timeout is 0, run to completion (no auto-suspend)
+    if suspend_timeout == 0 {
+        return handle_exec_once_no_suspend(cmd).await;
+    }
+
+    // Resolve connection args
+    let resolved = match connection::resolve_connect_args(&cmd.connect) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let (handle, host, port, username) = match connection::connect_with_info(&resolved).await {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+
+    // Open channel
+    let mut channel = match handle.channel_open_session().await.context("opening exec channel") {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+
+    // Request PTY if needed
+    if cmd.pty {
+        if let Err(e) = channel.request_pty(true, "xterm-256color", cmd.cols, cmd.rows, 0, 0, &[]).await {
+            return err(anyhow::anyhow!("requesting PTY: {}", e));
+        }
+    }
+
+    let command = cmd.command.join(" ");
+
+    // Start the command
+    if let Err(e) = channel.exec(true, command.as_str()).await {
+        return err(anyhow::anyhow!("exec: {}", e));
+    }
+
+    // Collect output until either command finishes or suspend timeout
+    let suspend_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(suspend_timeout);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut exit_code: i32 = -1;
+    let mut saw_eof = false;
+    let mut finished = false;
+
+    loop {
+        let remaining = suspend_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break; // suspend timeout reached
+        }
+
+        match tokio::time::timeout(remaining, channel.wait()).await {
+            Ok(Some(msg)) => {
+                if !connection::handle_exec_msg(Some(msg), &mut stdout, &mut stderr, &mut exit_code, &mut saw_eof) {
+                    finished = true;
+                    break;
+                }
+            }
+            Ok(None) => {
+                finished = true;
+                break;
+            }
+            Err(_) => {
+                break; // timeout
+            }
+        }
+    }
+
+    if finished {
+        // Command finished within suspend timeout
+        let stdout_str = String::from_utf8_lossy(&stdout).into_owned();
+        let stderr_str = String::from_utf8_lossy(&stderr).into_owned();
+        ok(json!({
+            "ok": true,
+            "status": "completed",
+            "stdout": stdout_str,
+            "stderr": stderr_str,
+            "exit_code": exit_code,
+        }))
+    } else {
+        // Command still running, create session
+        let (session_id, connection_id) = {
+            let mut st = state.lock().await;
+            let connection_id = format!("c{}", st.next_connection_id);
+            st.next_connection_id += 1;
+            let session_id = format!("s{}", st.next_id);
+            st.next_id += 1;
+            (session_id, connection_id)
+        };
+
+        // Create output buffer with any data already collected
+        let output = Arc::new(std::sync::Mutex::new(session::OutputBuffer::default()));
+        if !stdout.is_empty() {
+            output.lock().unwrap().extend(&stdout);
+        }
+        if !stderr.is_empty() {
+            output.lock().unwrap().extend(&stderr);
+        }
+
+        let status = Arc::new(std::sync::Mutex::new(SessionStatus::Running));
+        let exit_status = Arc::new(std::sync::Mutex::new(None));
+        let exit_signal = Arc::new(std::sync::Mutex::new(None));
+        let drain_dead = Arc::new(std::sync::Mutex::new(false));
+        let updated_at = Arc::new(std::sync::Mutex::new(now_ms()));
+
+        // Spawn drain task to continue collecting output
+        let cmd_tx = session::spawn_drain_task(
+            channel,
+            output.clone(),
+            status.clone(),
+            exit_status.clone(),
+            exit_signal.clone(),
+            drain_dead.clone(),
+            updated_at.clone(),
+        ).await;
+
+        let mut st = state.lock().await;
+        st.connections.insert(
+            connection_id.clone(),
+            SharedConnection { handle: handle.clone(), refcount: 1 },
+        );
+
+        let session = SessionHandle {
+            id: session_id.clone(),
+            connection_id: connection_id.clone(),
+            host,
+            port,
+            username,
+            cols: cmd.cols,
+            rows: cmd.rows,
+            reconnect: false,
+            connect_args: resolved,
+            created_at: now_ms(),
+            updated_at,
+            output,
+            status,
+            exit_status,
+            exit_signal,
+            cmd_tx,
+            drain_dead,
+        };
+
+        st.sessions.insert(session_id.clone(), session);
+
+        ok(json!({
+            "ok": true,
+            "status": "suspended",
+            "session_id": session_id,
+            "message": format!("Command still running after {}ms. Session created.", suspend_timeout),
+            "commands": {
+                "read": format!("agentssh session read --session-id {}", session_id),
+                "status": format!("agentssh session status --session-id {}", session_id),
+                "wait": format!("agentssh session read --session-id {} --follow", session_id),
+            }
+        }))
+    }
+}
+
+/// Exec without suspend: run command to completion (used when suspend_timeout = 0).
+async fn handle_exec_once_no_suspend(cmd: ExecCommand) -> WireResponse {
+    let resolved = match connection::resolve_connect_args(&cmd.connect) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let (handle, _, _, _) = match connection::connect_with_info(&resolved).await {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+
+    let mut channel = match handle.channel_open_session().await.context("opening exec channel") {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+
+    if cmd.pty {
+        if let Err(e) = channel.request_pty(true, "xterm-256color", cmd.cols, cmd.rows, 0, 0, &[]).await {
+            return err(anyhow::anyhow!("requesting PTY: {}", e));
+        }
+    }
+
+    let command = cmd.command.join(" ");
+    match connection::exec_channel(&mut channel, &command, Some(cmd.timeout)).await {
+        Ok((stdout, stderr, exit_code)) => ok(json!({
+            "ok": true,
+            "status": "completed",
+            "stdout": stdout,
+            "stderr": stderr,
+            "exit_code": exit_code,
+        })),
+        Err(e) => err(e),
+    }
+}
+
 async fn handle_send_request(cmd: SessionInputCommand, state: Arc<Mutex<ServerState>>) -> WireResponse {
     let pairs = cmd.expect_pairs().unwrap_or_default();
     let (cmd_tx, output, status, exit_status, exit_signal) = {
@@ -615,7 +816,7 @@ fn daemon_handle_for_session(
 async fn handle_upload_request(cmd: TransferCommand, state: Arc<Mutex<ServerState>>) -> WireResponse {
     let handle = match {
         let st = state.lock().await;
-        daemon_handle_for_session(&st, cmd.session_id.as_deref())
+        daemon_handle_for_session(&st, cmd.file.session_id.as_deref())
     } {
         Ok(v) => v,
         Err(e) => return err(e),
@@ -631,7 +832,7 @@ async fn handle_upload_request(cmd: TransferCommand, state: Arc<Mutex<ServerStat
 async fn handle_download_request(cmd: TransferCommand, state: Arc<Mutex<ServerState>>) -> WireResponse {
     let handle = match {
         let st = state.lock().await;
-        daemon_handle_for_session(&st, cmd.session_id.as_deref())
+        daemon_handle_for_session(&st, cmd.file.session_id.as_deref())
     } {
         Ok(v) => v,
         Err(e) => return err(e),
@@ -647,7 +848,7 @@ async fn handle_download_request(cmd: TransferCommand, state: Arc<Mutex<ServerSt
 async fn handle_ls_request(cmd: ListCommand, state: Arc<Mutex<ServerState>>) -> WireResponse {
     let handle = match {
         let st = state.lock().await;
-        daemon_handle_for_session(&st, cmd.session_id.as_deref())
+        daemon_handle_for_session(&st, cmd.file.session_id.as_deref())
     } {
         Ok(v) => v,
         Err(e) => return err(e),
@@ -662,7 +863,7 @@ async fn handle_ls_request(cmd: ListCommand, state: Arc<Mutex<ServerState>>) -> 
 async fn handle_write_request(cmd: WriteCommand, state: Arc<Mutex<ServerState>>) -> WireResponse {
     let handle = match {
         let st = state.lock().await;
-        daemon_handle_for_session(&st, cmd.session_id.as_deref())
+        daemon_handle_for_session(&st, cmd.file.session_id.as_deref())
     } {
         Ok(v) => v,
         Err(e) => return err(e),
@@ -677,7 +878,7 @@ async fn handle_write_request(cmd: WriteCommand, state: Arc<Mutex<ServerState>>)
 async fn handle_read_file_request(cmd: ReadFileCommand, state: Arc<Mutex<ServerState>>) -> WireResponse {
     let handle = match {
         let st = state.lock().await;
-        daemon_handle_for_session(&st, cmd.session_id.as_deref())
+        daemon_handle_for_session(&st, cmd.file.session_id.as_deref())
     } {
         Ok(v) => v,
         Err(e) => return err(e),
@@ -692,7 +893,7 @@ async fn handle_read_file_request(cmd: ReadFileCommand, state: Arc<Mutex<ServerS
 async fn handle_delete_file_request(cmd: DeleteFileCommand, state: Arc<Mutex<ServerState>>) -> WireResponse {
     let handle = match {
         let st = state.lock().await;
-        daemon_handle_for_session(&st, cmd.session_id.as_deref())
+        daemon_handle_for_session(&st, cmd.file.session_id.as_deref())
     } {
         Ok(v) => v,
         Err(e) => return err(e),
@@ -707,7 +908,7 @@ async fn handle_delete_file_request(cmd: DeleteFileCommand, state: Arc<Mutex<Ser
 async fn handle_edit_file_request(cmd: EditFileCommand, state: Arc<Mutex<ServerState>>) -> WireResponse {
     let handle = match {
         let st = state.lock().await;
-        daemon_handle_for_session(&st, cmd.session_id.as_deref())
+        daemon_handle_for_session(&st, cmd.file.session_id.as_deref())
     } {
         Ok(v) => v,
         Err(e) => return err(e),
@@ -1015,7 +1216,6 @@ pub fn run_read_command(command: ReadCommand, json_output: bool) -> Result<()> {
             wait_ms: 500,
             follow: false,
             raw,
-            strip_ansi: false,
             timeout: timeout_ms,
         });
 

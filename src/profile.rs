@@ -102,11 +102,8 @@ fn has_profile_add_flags(connect: &ConnectArgs) -> bool {
         || connect.port.is_some()
         || connect.username.is_some()
         || connect.password.is_some()
-        || connect.password_env.is_some()
-        || connect.private_key_path.is_some()
-        || connect.private_key_env.is_some()
+        || connect.private_key.is_some()
         || connect.passphrase.is_some()
-        || connect.passphrase_env.is_some()
         || connect.ready_timeout_ms.is_some()
         || connect.retry.is_some()
         || connect.retry_delay_ms.is_some()
@@ -129,11 +126,11 @@ fn prompt_for_profile() -> Result<ConnectArgs> {
     stdout.flush()?;
     let port = read_prompt_line(&mut reader)?;
 
-    write!(stdout, "Private key path (leave empty to skip): " )?;
+    write!(stdout, "Private key (path, env var $ prefix, or inline content; leave empty to skip): " )?;
     stdout.flush()?;
-    let private_key_path = read_prompt_line(&mut reader)?;
+    let private_key = read_prompt_line(&mut reader)?;
 
-    build_profile_from_prompts(&format!("{}\n{}\n{}\n{}\n", host, username, port, private_key_path))
+    build_profile_from_prompts(&format!("{}\n{}\n{}\n{}\n", host, username, port, private_key))
 }
 
 fn read_prompt_line(reader: &mut impl BufRead) -> Result<String> {
@@ -168,10 +165,10 @@ fn build_profile_from_prompts(input: &str) -> Result<ConnectArgs> {
             username.to_string()
         }),
         port: Some(port),
-        private_key_path: if private_key_text.is_empty() {
+        private_key: if private_key_text.is_empty() {
             None
         } else {
-            Some(PathBuf::from(private_key_text))
+            Some(private_key_text.to_string())
         },
         ..Default::default()
     })
@@ -188,6 +185,6 @@ mod tests {
         assert_eq!(profile.host.as_deref(), Some("example.com"));
         assert_eq!(profile.username.as_deref(), Some("root"));
         assert_eq!(profile.port, Some(22));
-        assert_eq!(profile.private_key_path, None);
+        assert_eq!(profile.private_key, None);
     }
 }

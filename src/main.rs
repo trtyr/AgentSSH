@@ -1,6 +1,5 @@
 mod cli;
 mod connection;
-mod interactive;
 mod kernel;
 mod profile;
 mod protocol;

@@ -1,5 +1,5 @@
 use crate::cli::{
-    ConnectCommand, DeleteFileCommand, EditFileCommand, ListCommand, ProxyCloseCommand,
+    ConnectCommand, DeleteFileCommand, EditFileCommand, ExecCommand, ListCommand, ProxyCloseCommand,
     ProxyCreateCommand, ProxyPingCommand, ReadCommand, ReadFileCommand, ResizeCommand,
     SessionExecCommand, SessionInputCommand, SignalCommand, SpawnCommand, StatusCommand,
     TransferCommand, WriteCommand,
@@ -21,6 +21,7 @@ pub enum WireRequest {
     Send(SessionInputCommand),
     Spawn(SpawnCommand),
     Exec(SessionExecCommand),
+    ExecOnce(ExecCommand),
     Read(ReadCommand),
     Resize(ResizeCommand),
     Signal(SignalCommand),
