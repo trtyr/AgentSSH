@@ -10,7 +10,7 @@
 
 AgentSSH 通过 `russh` — 纯 Rust 异步 SSH 实现 — 直接跟 SSH 协议对话。一个二进制文件：客户端 + 守护进程 + 代理。无需安装 C 库。没有 shell 包装。输出全部结构化 JSON。为 agent 设计，人也能用。
 
-[🐙 GitHub](https://github.com/cft0808/agentssh) · [📦 crates.io](https://crates.io/crates/agentssh) · [🔧 快速上手](#-快速上手) · [🏗️ 架构](#-架构) · [📋 命令速查](#-命令速查)
+[🐙 GitHub](https://github.com/trtyr/AgentSSH) · [📦 crates.io](https://crates.io/crates/agentssh) · [🔧 快速上手](#-快速上手) · [🏗️ 架构](#-架构) · [📋 命令速查](#-命令速查)
 
 ---
 
@@ -56,7 +56,7 @@ cargo build --release
 agentssh profile add prod \
   --host example.com \
   --username root \
-  --private-key-path ~/.ssh/id_ed25519
+  --private-key ~/.ssh/id_ed25519
 
 agentssh profile list
 # tencent   root@82.157.147.224:22
@@ -66,24 +66,50 @@ agentssh profile list
 ### ⚡ 执行命令（一次性）
 
 ```bash
-agentssh --json exec --profile prod --retry 3 -- uptime
-# {"ok":true,"data":{"exit_code":0,"stdout":"21:03:01 up 42 days\n","stderr":""}}
+agentssh --output json exec --profile prod --retry 3 -- uptime
+# {"ok":true,"status":"completed","exit_code":0,"stdout":"21:03:01 up 42 days\n","stderr":""}
 ```
 
 命令通过 `/bin/sh -c` 执行——管道、重定向、链式命令原生支持：
 
 ```bash
 # 管道过滤
-agentssh --json exec --profile prod -- grep ERROR /var/log/syslog \| tail -5
+agentssh --output json exec --profile prod -- grep ERROR /var/log/syslog \| tail -5
 
 # 远程重定向写入文件
-agentssh --json exec --profile prod -- cat \> /etc/config \</dev/null
+agentssh --output json exec --profile prod -- cat \> /etc/config \</dev/null
 
 # 链式命令
-agentssh --json exec --profile prod -- ls /etc \&\& systemctl status nginx
+agentssh --output json exec --profile prod -- ls /etc \&\& systemctl status nginx
 ```
 
 > **提示**：用反斜杠转义 `|`、`>`、`&&` 防止本地 shell 吞掉它们。
+
+### ⏱️ 自动挂起（长时间运行的命令）
+
+`exec` 会在 30 秒后自动挂起长时间运行的命令（可配置）：
+
+```bash
+# 短命令 → 立即返回
+agentssh exec -p prod -- uptime
+# → {"status":"completed", "stdout":"...", "exit_code":0}
+
+# 长命令 → 30 秒后自动挂起，返回 session ID
+agentssh exec -p prod -- cargo build
+# → {"status":"suspended", "session_id":"s7", "commands":{...}}
+
+# 查看挂起的命令
+agentssh session status --session-id s7
+agentssh session read --session-id s7 --follow
+
+# 启动 server 不阻塞
+agentssh exec -p prod -- python3 app.py
+# → {"status":"suspended", "session_id":"s8", ...}
+# server 继续在远程主机上运行
+
+# 永不挂起（一直等待）
+agentssh exec -p prod --suspend-timeout 0 -- short-command
+```
 
 ### 🔄 长连接会话
 
@@ -185,8 +211,9 @@ agentssh proxy close --all
 ## 📋 命令参考
 
 ```bash
-# ⚡ 一次性执行
+# ⚡ 一次性执行（30 秒后自动挂起）
 agentssh exec                          # 执行命令 → stdout + exit code
+agentssh exec --suspend-timeout 0      # 永不挂起，一直等待
 agentssh shell                         # 交互式 PTY（人用）
 
 # 🔄 会话管理
@@ -239,7 +266,7 @@ agentssh daemon shutdown               # 停止守护进程 + 清理
       "host": "example.com",
       "port": 22,
       "username": "root",
-      "private_key_path": "~/.ssh/id_ed25519",
+      "private_key": "~/.ssh/id_ed25519",
       "retry": 3,
       "retry_delay_ms": 250
     }
@@ -247,7 +274,7 @@ agentssh daemon shutdown               # 停止守护进程 + 清理
 }
 ```
 
-支持字段：`host`, `port`, `username`, `password`, `password_env`, `private_key_path`, `private_key_env`, `passphrase`, `passphrase_env`, `ready_timeout_ms`, `retry`, `retry_delay_ms`。
+支持字段：`host`, `port`, `username`, `password`（前缀 `$` 读取环境变量）, `private_key`（路径、`$ENV` 或内联内容）, `passphrase`（前缀 `$` 读取环境变量）, `ready_timeout_ms`, `retry`, `retry_delay_ms`。
 
 支持重试的命令：`exec`、`connect`、`file upload`、`file download`、`file ls`、`proxy create`。重试仅针对 TCP 连接和 SSH 握手失败。
 
@@ -285,3 +312,7 @@ AgentSSH 使用 Trust-On-First-Use (TOFU) 机制配合 `~/.ssh/known_hosts`：
 ## 📄 协议
 
 MIT
+
+---
+
+⭐ 觉得有用？去 [GitHub](https://github.com/trtyr/AgentSSH) 给个 star。

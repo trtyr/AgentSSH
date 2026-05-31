@@ -1,178 +1,162 @@
 # AGENTS.md — agentssh
 
-Standalone Rust SSH/SFTP CLI for AI-agent SSH and SFTP workflows.
+**Generated:** 2026-05-31 · **Commit:** `935b4fe` · **Branch:** `main`
 
-## Build & run
+## OVERVIEW
 
-```bash
-cargo build                    # debug build
-cargo run -- <subcommand> ...  # run any command
-cargo build --release          # release binary at target/release/agentssh
+Standalone Rust SSH/SFTP CLI for AI-agent workflows. Microkernel design: the same `agentssh` binary is both client and daemon, dispatched by subcommand.
+
+**Stack:** Rust edition 2024 (≥1.85) · `russh` 0.61 · `tokio` · `clap` (derive) · `serde_json`
+**Pure Rust — no C deps. Unix only** (`UnixListener`/`UnixStream`).
+
+## STRUCTURE
+
+```
+.
+├── src/               # 12 flat .rs modules, no subdirectories
+│   ├── main.rs        # boots cli::run()
+│   ├── cli.rs         # clap parser + command dispatch (967 loc)
+│   ├── kernel.rs      # daemon, Unix-socket IPC, ServerState (1148 loc — largest)
+│   ├── connection.rs  # SSH connect pool, known_hosts TOFU (711 loc)
+│   ├── session.rs     # RemoteSession, OutputBuffer, SessionStatus
+│   ├── sftp.rs        # SFTP/SCP/exec file transfer with method fallback
+│   ├── proxy.rs       # port forwarding + SOCKS5 (RFC 1928)
+│   ├── ssh_backend.rs # one-shot exec/shell/file ops
+│   ├── protocol.rs    # WireRequest/WireResponse, JSON-line wire protocol
+│   ├── profile.rs     # CRUD for ~/.config/agentssh/profiles.json
+│   └── util.rs        # constants, ANSI stripping, socket paths
+├── tests/e2e.rs       # single integration test file (94 tests total across project)
+├── docs/plantree/     # planning documents
+└── Cargo.toml         # no [lints], no [profile], no [dev-dependencies]
 ```
 
-**Rust edition 2024** — needs Rust ≥ 1.85. If `cargo build` fails with edition errors, update rustup.
+## CODE MAP
 
-**Pure Rust — no C dependencies.** Uses `russh` (async SSH) and `russh-sftp`. No system library installation required.
+**Entry points (crabmap):**
+| Entry | File | Role |
+|-------|------|------|
+| `cli::run()` | `src/cli.rs` | top-level dispatch |
+| `kernel::run_server()` | `src/kernel.rs` | daemon server loop |
+| `kernel::run_client()` | `src/kernel.rs` | client → daemon IPC |
+| `ssh_backend::run_shell()` | `src/ssh_backend.rs` | interactive PTY shell |
 
-**Unix only.** Uses `UnixListener`/`UnixStream`; will not compile on Windows.
+**Hot symbols (most connected):**
+| Symbol | Kind | File | Degree | Role |
+|--------|------|------|--------|------|
+| `ServerState::new` | method | kernel.rs | 78 | daemon state init |
+| `ConnectArgs` | struct | cli.rs | 47 | SSH connection config |
+| `WireRequest` | enum | protocol.rs | 30 | IPC wire format |
 
-## Architecture
+**Fan-out (crabmap):**
+| File | Fan-in | Fan-out | Total |
+|------|--------|---------|-------|
+| kernel.rs | 10 | 8 | 18 |
+| cli.rs | 11 | 6 | 17 |
+| connection.rs | 6 | 4 | 10 |
+| util.rs | 8 | 1 | 9 |
 
-Microkernel design. The CLI binary is both client and daemon — the same binary dispatched by subcommand:
+## HEALTH (crabmap)
 
-| Command group   | Path                                                                 | Notes                                                                     |
-| --------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| `exec`, `shell` | `ssh_backend::run_exec/shell()`                                      | One-shot; no daemon needed. `exec` joins args with spaces; the SSH server's own exec handling interprets shell metacharacters. |
-| `connect`       | `kernel::run_client(WireRequest::Connect)`                           | Starts a long-lived PTY session and a shared SSH connection entry         |
-| `session *`     | `kernel::run_client()` / `kernel::run_read_command()`                | Daemon-backed session lifecycle, spawn, exec, health, and streaming reads |
-| `file *`        | daemon or one-shot SSH depending on `--session-id`                   | Shared transfer structs, dual-path routing                                |
-| `proxy *`       | `kernel::run_client()` → daemon-managed async tasks                   | Local port forwarding (`-L`) and SOCKS5 (`-D`) via `channel_direct_tcpip` |
-| `profile *`     | `profile::run_profile()`                                             | Direct file I/O, no daemon                                                |
-| `daemon *`      | `kernel::run_server()` / `kernel::run_client(WireRequest::Shutdown)` | Daemon lifecycle commands                                                 |
+- **Score:** 100/100
+- **Cycles:** none
+- **God modules:** none
+- **Dead code:** none
 
-Key modules:
+## ARCHITECTURE
 
-- `main.rs` — only boots `cli::run()`
-- `cli.rs` — clap parser + grouped command dispatch
-- `kernel.rs` — daemon lifecycle, Unix-socket IPC, `ServerState`, heartbeat thread, follow-read client loop
-- `protocol.rs` — `WireRequest`/`WireResponse`, JSON-line wire protocol over Unix socket
-- `ssh_backend.rs` — SSH/PTY/SFTP logic, session health refresh, ping handling
-- `proxy.rs` — local port forwarding and SOCKS5 proxy, async listener, SOCKS5 handshake (RFC 1928)
-- `profile.rs` — CRUD for `~/.config/agentssh/profiles.json`
-- `util.rs` — constants (defaults), `config_dir()`, `runtime_socket_path()`, `expand_home()`, JSON helpers
+Microkernel: CLI binary is client + daemon. Subcommands route to one-shot SSH or daemon-managed sessions:
 
-## Daemon lifecycle
+| Command group | Path | Notes |
+|---------------|------|-------|
+| `exec` | `kernel::run_client(WireRequest::ExecOnce)` | daemon-managed with auto-suspend |
+| `shell` | `ssh_backend::run_shell()` | one-shot; no daemon |
+| `connect` | `kernel::run_client(WireRequest::Connect)` | long-lived PTY + pooled connection |
+| `session *` | `kernel::run_client` / `run_read_command` | daemon-backed lifecycle |
+| `file *` | daemon or one-shot via `--session-id` | dual-path routing |
+| `proxy *` | `kernel::run_client` → async listener tasks | `-L` forward + `-D` SOCKS5 |
+| `profile *` | `profile::run_profile()` | direct file I/O |
+| `daemon *` | `kernel::run_server` / `Shutdown` | daemon lifecycle |
 
-- Client commands that need a long-lived session (`connect`, `session send`, `session read`, etc.) call `ensure_daemon()` which spawns `agentssh daemon serve` as a background process if the socket isn't alive.
-- Socket path: `$XDG_RUNTIME_DIR/agentssh-{sanitized_user}.sock` (falls back to temp dir).
-- The daemon stays up until `agentssh daemon shutdown` or killed. Sessions are in-memory only — restart = all sessions lost.
-- Wire protocol: one JSON `WireRequest` per line → one JSON `WireResponse` per line. Stateless per-request; session state lives in `ServerState::sessions`.
-- `ServerState::connections` tracks shared SSH `Session` objects by `connection_id`; each entry holds the authenticated SSH session plus a channel refcount.
-- `connect` creates both a session record and a new pooled connection. `session spawn --from <id>` opens a fresh PTY channel on the same pooled SSH connection, increments the refcount, and creates another session record.
-- `session exec --session-id <id> -- <command>` runs a single command on the session's SSH connection via `channel.exec()` — no PTY, returns clean stdout/stderr/exit_code. Command args are joined with spaces and wrapped in `/bin/sh -c`, so shell metacharacters (`|`, `>`, `&&`, `;`) are interpreted by the remote shell. Contrast with `session send` which sends raw text through the PTY channel (suitable for interactive use).
-- `session close` decrements the connection refcount and drops the pooled SSH session when the last channel closes.
-- A background heartbeat thread wakes every 60 seconds and drains PTY output for each session.
-- When `--reconnect` is passed to `connect`, the heartbeat also watches for SSH transport disconnections and automatically re-establishes the connection with a fresh PTY channel. Reconnect uses the stored `ConnectArgs` for authentication and appends a `[AgentSSH] session <id> reconnected` notice to the output buffer.
+### Exec auto-suspend
 
-## Profiles
+`exec` goes through daemon. Default `--suspend-timeout 30000` (30s):
+- Command finishes within timeout → return result immediately
+- Still running after timeout → auto-suspend, return session ID + instructions
+- `--suspend-timeout 0` → never suspend, run to completion
 
-- Stored at `~/.config/agentssh/profiles.json` (overridable via `AGENTSSH_CONFIG_DIR` env var).
-- Format: `{"profiles": {"name": {ConnectArgs fields ...}}}` — a flat JSON object of named `ConnectArgs`.
-- `--profile prod` merges with any inline `--host`/`--username`/etc.: inline args take precedence.
-
-## JSON output
-
-Pass `--json` _before_ the subcommand: `agentssh --json exec --profile prod -- id`. Most commands wrap output in `{"ok":true,"data":...}`. `agentssh --json session read --follow ...` instead emits one compact JSON object per line so clients can stream updates incrementally.
-
-## Exec command shell model
-
-Both one-shot `exec` and `session exec` join all trailing args with spaces and pass them to the SSH server. The SSH server (OpenSSH) runs the command through the user's login shell (`$SHELL -c`), so:
-
-- Shell metacharacters (`|`, `>`, `&&`, `;`) are interpreted by the remote shell
-- Escaping metacharacters on the CLI prevents the local shell from eating them: `\|`, `\>`, `\&\&`
-- Or quote the entire command: `agentssh exec -- "grep ERROR /var/log/syslog | tail -5"`
-- This matches `ssh`, `kubectl exec`, and `docker exec` behavior
-
-## Session output model
-
-The daemon buffers PTY output in `RemoteSession::output` with a cursor. Each `session send`/`session read` drains the channel, appends to the buffer, and returns a page (text from cursor, limited by `--limit`, default 8000 bytes). The cursor advances so repeated reads return new output. Buffer is capped at `MAX_BUFFER` (1 MB) — oldest data is trimmed when the limit is hit.
-
-`session send` also supports up to three expect/respond pairs. After sending the primary input, the daemon scans the accumulated output buffer for each `expect` pattern using case-insensitive regex matching when the pattern compiles, or case-insensitive substring fallback otherwise. On match, it sends the paired `respond` text and drains output again before returning.
-
-`session read --follow` is implemented client-side: it repeatedly issues normal `Read` requests, prints one JSON line per page, and stops on shell exit, disconnect, SIGINT, or timeout.
-
-### Output cleaning
-
-PTY output is scrubbed before being returned to callers (`util::strip_ansi`). The cleaning pipeline removes:
-
-- ANSI escape sequences (CSI, OSC, simple ESC codes)
-- Private Use Area characters (`U+E000`–`U+F8FF`) — eliminates Nerd Font icon garbage
-- Non-printable control characters except `\n`, `\r`, `\t`
-
-This keeps session output readable for AI agents even when the remote shell uses fancy prompts. Pass `--raw` on `session send` or `session read` to bypass cleaning and get the raw PTY bytes.
-
-## Session health
-
-- `session ping --session-id <id>` refreshes the target session and returns `alive` plus current `status`.
-- Health for spawned sessions is shared at the SSH transport level because all channels in the same `connection_id` use one pooled SSH session.
-- Dead-but-not-closed sessions are marked `disconnected`.
-
-## SFTP dual path (important)
-
-`file upload`, `file download`, and `file ls` each have two code paths:
-
-1. **With `--session-id`** → routed through daemon (`kernel::run_client`), reuses the existing SSH session.
-2. **Without `--session-id`** → one-shot SSH connection (`ssh_backend::run_*_once`), connects + does the operation + disconnects.
-
-The `TransferCommand` and `ListCommand` structs carry both `ConnectArgs` and optional `session_id`. The routing decision lives in `cli.rs`.
-
-### Transfer method fallback
-
-`--method auto` (default) tries protocols in order:
-
-1. **SFTP** — full-featured; works on most Linux servers.
-2. **SCP** — simpler protocol via `scp_send`/`scp_recv`; works when SFTP subsystem is disabled.
-3. **exec** — base64 + PowerShell (`[IO.File]::WriteAllBytes` / `[IO.File]::ReadAllBytes`); handles Windows OpenSSH servers where neither SFTP nor SCP is available.
-
-SCP upload requires `wait_eof()` before `wait_close()` to avoid channel errors. Exec upload is limited to ~22 KB of raw file data (base64-encoded command ≤ 30,000 chars). Use `--method sftp` or `--method scp` to bypass fallback and force a specific protocol.
-
-## Proxy (port forwarding & SOCKS5)
-
-`agentssh proxy` provides SSH tunneled proxies managed by the daemon, with two modes:
-
-- **Local port forwarding** (`-L`): `--local <host:port> --remote <host:port>` — listens locally, forwards each connection through `channel_direct_tcpip` to the remote target.
-- **SOCKS5** (`-D`): `--socks5 <host:port>` — local SOCKS5 proxy, every connection performs a SOCKS5 handshake (RFC 1928, no-auth CONNECT only) then tunnels the target through `channel_direct_tcpip`.
-
-Each proxy lives in its own listener task inside the daemon. Accepted connections spawn per-connection async tasks that run a non-blocking bidirectional forward loop between the local TCP stream and the SSH direct-tcpip channel. Proxy lifecycle mirrors sessions: `create`/`list`/`ping`/`close` (with `--all`). Each proxy increments the connection refcount on its pooled SSH session.
-
-On macOS, `TcpListener::set_nonblocking(true)` causes accepted `TcpStream` sockets to inherit the non-blocking flag. The SOCKS5 handshake explicitly sets the stream back to blocking before reading the handshake frames, then switches to non-blocking for the forwarding loop.
-
-## Security
-
-### Host key verification (TOFU)
-
-AgentSSH uses Trust-On-First-Use (TOFU) with `~/.ssh/known_hosts`:
-
-- **First connection**: the server's host key is appended to `known_hosts` automatically.
-- **Subsequent connections**: the key is verified against the stored entry. A mismatch aborts with an error (host key changed).
-- Non-standard ports use the `[host]:port` bracketed format in `known_hosts`.
-
-### Exec fallback shell escaping
-
-When the exec fallback method is used for file operations, commands are constructed with `shell_words::quote()` to safely escape arguments and prevent shell injection.
-
-## Testing
-
-Small unit tests live in `cli.rs`, `kernel.rs`, and `ssh_backend.rs`. For manual smoke testing:
-
+Suspended session commands:
 ```bash
-# Profile CRUD
-cargo run -- profile write test --data '{"host":"localhost","username":"root"}'
-cargo run -- profile list
-
-# One-shot exec (needs a real SSH target)
-cargo run -- exec --profile test -- uname -a
-
-# Daemon session
-cargo run -- connect --profile test
-cargo run -- session send --session-id s1 --input "ls\n"
-cargo run -- session exec --session-id s1 -- uname -a
-cargo run -- session read --session-id s1
-cargo run -- session ping --session-id s1
-cargo run -- session close --session-id s1
-cargo run -- daemon shutdown
-
-# Proxy (port forwarding & SOCKS5)
-cargo run -- proxy create --profile test --local 127.0.0.1:9999 --remote 127.0.0.1:8080
-cargo run -- proxy list
-cargo run -- proxy ping --proxy-id p1
-cargo run -- proxy close --proxy-id p1
-cargo run -- proxy create --profile test --socks5 127.0.0.1:1080
-cargo run -- proxy close --all
+agentssh session read --session-id s7        # get output
+agentssh session status --session-id s7      # check status
+agentssh session read --session-id s7 --follow  # wait for completion
 ```
 
-## Code conventions
+### Daemon lifecycle
 
-- `anyhow::Result<()>` throughout; errors propagated with `.context()`.
-- Serde derive macros on nearly all command structs — they double as wire format.
-- PTY dimensions default to 120×40 (`util.rs` constants).
+- `ensure_daemon()` spawns `agentssh daemon serve` if socket not alive.
+- Socket: `$XDG_RUNTIME_DIR/agentssh-{user}.sock` (temp dir fallback).
+- Wire protocol: one JSON `WireRequest` per line → one `WireResponse` per line. Stateless per-request.
+- `connect` creates session + pooled connection. `session spawn --from <id>` reuses the same SSH connection (refcount).
+- `session close` decrements refcount, drops SSH session when last channel closes.
+- Heartbeat: every 60s drains PTY output. `--reconnect` auto-reconnects on disconnect.
+
+### Session output model
+
+- Daemon buffers PTY output with cursor. Each `send`/`read` returns page from cursor (default 8000 bytes limit).
+- Buffer capped at 1 MB; oldest data trimmed on overflow.
+- `send` supports up to 3 expect/respond pairs (case-insensitive regex or substring).
+- `read --follow` is client-side: polls until exit, disconnect, SIGINT, or timeout.
+- ANSI/PUA/control chars stripped (`util::strip_ansi`). Pass `--raw` to bypass.
+
+### SFTP dual path
+
+- **With `--session-id`** → daemon, reuses SSH session.
+- **Without** → one-shot connection (`ssh_backend::run_*_once`).
+- `--method auto` fallback: SFTP → SCP → exec (base64 + PS for Windows). SCP upload needs `wait_eof()` before `wait_close()`.
+
+### Proxy (port forwarding & SOCKS5)
+
+- `--local host:port --remote host:port` → local port forward via `channel_direct_tcpip`.
+- `--socks5 host:port` → SOCKS5 proxy, no-auth CONNECT only (RFC 1928).
+- macOS: `set_nonblocking(true)` on listener → accepted streams inherit. SOCKS5 handshake sets blocking for handshake frames, then non-blocking for forward loop.
+
+## SECURITY
+
+- **TOFU host keys:** `~/.ssh/known_hosts`. First connection appends, subsequent verify. Mismatch aborts. Non-standard ports use `[host]:port`.
+- **Exec fallback escaping:** `shell_words::quote()` prevents shell injection in file transfer exec path.
+
+## JSON OUTPUT
+
+Pass `--output json` before subcommand: `agentssh --output json exec --profile prod -- id`. Most commands: `{"ok":true,...}`. `session read --follow`: one compact JSON object per line.
+
+## EXEC SHELL MODEL
+
+`exec` and `session exec` join args with spaces → `/bin/sh -c`. Shell metacharacters (`|`, `>`, `&&`, `;`) interpreted by remote shell. Escape on CLI: `\|`, `\>`, `\&\&`, or quote: `agentssh exec -- "cmd1 | cmd2"`.
+
+## TESTING
+
+94 tests total: 61 unit (inline `#[cfg(test)]` in 8 src files) + 33 E2E (`tests/e2e.rs`).
+
+**E2E test tiers:**
+| Tier | Count | Scope | Run |
+|------|-------|-------|-----|
+| P0 | 19 | CLI basics, profile CRUD, JSON output | `cargo test --test e2e` |
+| P1 | 5 | daemon status, flag validation, file method | `cargo test --test e2e` |
+| P2 | 9 | SSH-required (exec, shell, sessions) | `cargo test --test e2e -- --ignored` |
+
+**E2E conventions:**
+- Tests run binary via `cargo run -q -- <args>` subprocess — tests real CLI.
+- Profile isolation: each test creates `AGENTSSH_CONFIG_DIR` temp dir.
+- P2 tests marked `#[ignore]` + runtime env check (`AGENTSSH_E2E_SSH_HOST`).
+- E2E requires: `AGENTSSH_E2E_SSH_HOST` (and optionally `_USER`, `_PORT`).
+
+Run all (no SSH): `cargo test`
+
+## CONVENTIONS
+
+- `anyhow::Result<()>` throughout; errors with `.context()`.
+- Serde derive on all command structs — doubles as wire format.
+- PTY defaults: 120×40 (`DEFAULT_COLS`/`DEFAULT_ROWS` in `util.rs`).
+- No `[lints]`, no `rustfmt.toml`, no CI/CD, no `[profile.release]` — all tool defaults.
+- `WireRequest` uses `#[serde(tag = "action", rename_all = "snake_case")]`.
+- `use crate::cli::*` glob imports in `kernel.rs` and `sftp.rs` — CLI types leak across modules.

@@ -12,7 +12,7 @@
 
 AgentSSH speaks SSH directly through `russh` — a pure-Rust async SSH implementation. One binary: client + daemon + proxy. No C library to install. No shell wrapping. All output in structured JSON. Built for agents, also works for humans.
 
-[🐙 GitHub](https://github.com/cft0808/agentssh) · [📦 crates.io](https://crates.io/crates/agentssh) · [🔧 Quick Start](#-quick-start) · [🏗️ Architecture](#-architecture) · [📋 Command Reference](#-command-reference)
+[🐙 GitHub](https://github.com/trtyr/AgentSSH) · [📦 crates.io](https://crates.io/crates/agentssh) · [🔧 Quick Start](#-quick-start) · [🏗️ Architecture](#-architecture) · [📋 Command Reference](#-command-reference)
 
 ---
 
@@ -58,7 +58,7 @@ cargo build --release
 agentssh profile add prod \
   --host example.com \
   --username root \
-  --private-key-path ~/.ssh/id_ed25519
+  --private-key ~/.ssh/id_ed25519
 
 agentssh profile list
 # tencent   root@82.157.147.224:22
@@ -68,24 +68,50 @@ agentssh profile list
 ### ⚡ Run & go (one-shot)
 
 ```bash
-agentssh --json exec --profile prod --retry 3 -- uptime
-# {"ok":true,"data":{"exit_code":0,"stdout":"21:03:01 up 42 days\n","stderr":""}}
+agentssh --output json exec --profile prod --retry 3 -- uptime
+# {"ok":true,"status":"completed","exit_code":0,"stdout":"21:03:01 up 42 days\n","stderr":""}
 ```
 
 Commands run through `/bin/sh -c` — pipes, redirects, and shell chains work natively:
 
 ```bash
 # Pipe and filter
-agentssh --json exec --profile prod -- grep ERROR /var/log/syslog \| tail -5
+agentssh --output json exec --profile prod -- grep ERROR /var/log/syslog \| tail -5
 
 # Redirect output to remote file
-agentssh --json exec --profile prod -- cat \> /etc/config \</dev/null
+agentssh --output json exec --profile prod -- cat \> /etc/config \</dev/null
 
 # Chain commands
-agentssh --json exec --profile prod -- ls /etc \&\& systemctl status nginx
+agentssh --output json exec --profile prod -- ls /etc \&\& systemctl status nginx
 ```
 
 > **Tip**: Escape `|`, `>`, `&&` with backslashes so your local shell doesn't eat them.
+
+### ⏱️ Auto-suspend (long-running commands)
+
+`exec` automatically suspends long-running commands after 30 seconds (configurable):
+
+```bash
+# Short command → returns immediately
+agentssh exec -p prod -- uptime
+# → {"status":"completed", "stdout":"...", "exit_code":0}
+
+# Long command → auto-suspends after 30s, returns session ID
+agentssh exec -p prod -- cargo build
+# → {"status":"suspended", "session_id":"s7", "commands":{...}}
+
+# Check suspended command
+agentssh session status --session-id s7
+agentssh session read --session-id s7 --follow
+
+# Start server without blocking
+agentssh exec -p prod -- python3 app.py
+# → {"status":"suspended", "session_id":"s8", ...}
+# Server continues running on remote host
+
+# Never suspend (wait forever)
+agentssh exec -p prod --suspend-timeout 0 -- short-command
+```
 
 ### 🔄 Long-lived sessions
 
@@ -187,8 +213,9 @@ agentssh proxy close --all
 ## 📋 Command reference
 
 ```bash
-# ⚡ One-shot
+# ⚡ One-shot (auto-suspend after 30s if still running)
 agentssh exec                          # Run command → stdout + exit code
+agentssh exec --suspend-timeout 0      # Never suspend, wait forever
 agentssh shell                         # Interactive PTY (human use)
 
 # 🔄 Sessions
@@ -241,13 +268,15 @@ agentssh daemon shutdown               # Stop daemon + cleanup
       "host": "example.com",
       "port": 22,
       "username": "root",
-      "private_key_path": "~/.ssh/id_ed25519",
+      "private_key": "~/.ssh/id_ed25519",
       "retry": 3,
       "retry_delay_ms": 250
     }
   }
 }
 ```
+
+Supported fields: `host`, `port`, `username`, `password` (prefix `$` for env var), `private_key` (path, `$ENV`, or inline), `passphrase` (prefix `$` for env var), `ready_timeout_ms`, `retry`, `retry_delay_ms`.
 
 ---
 
@@ -283,3 +312,7 @@ When the exec fallback method is used for file operations, commands are construc
 ## 📄 License
 
 MIT
+
+---
+
+⭐ Found this useful? Give it a star on [GitHub](https://github.com/trtyr/AgentSSH).
